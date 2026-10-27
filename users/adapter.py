@@ -1,8 +1,10 @@
 from allauth.account.adapter import DefaultAccountAdapter
+from django.conf import settings
 
 from config.env import FRONTEND_CONFIRM_EMAIL_URL, FRONTEND_PASSWORD_RESET_URL
-from users.utils import detect_platform_from_request, get_platform_frontend_url
 from users.constants import AuthSourceChoice
+from users.utils import detect_platform_from_request, get_platform_frontend_url
+
 
 class AccountAdapter(DefaultAccountAdapter):
     def get_email_confirmation_url(self, request, emailconfirmation):
@@ -18,12 +20,12 @@ class AccountAdapter(DefaultAccountAdapter):
         This method is called for all emails, including password reset emails.
         """
 
-        if template_prefix == 'account/email/password_reset_key':
-            uid = context['uid']
-            token = context['token']
+        if template_prefix == "account/email/password_reset_key":
+            uid = context["uid"]
+            token = context["token"]
 
             # Try to get request from context to detect platform
-            request = context.get('request')
+            request = context.get("request")
             if request:
                 platform = detect_platform_from_request(request)
                 callback_url = get_platform_frontend_url(platform)
@@ -33,6 +35,7 @@ class AccountAdapter(DefaultAccountAdapter):
                 callback_url = get_platform_frontend_url(AuthSourceChoice.DARE)
                 password_reset_url = f"{FRONTEND_PASSWORD_RESET_URL or ''}/{uid}/{token}?callbackurl={callback_url}"
 
-            context['password_reset_url'] = password_reset_url
+            context["password_reset_url"] = password_reset_url
 
+        context = {**context, "support_email": getattr(settings, "EMAIL_REPLY_TO", "")}
         return super().render_mail(template_prefix, email, context)

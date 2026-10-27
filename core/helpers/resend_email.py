@@ -8,7 +8,7 @@ resend.api_key = settings.EMAIL_HOST_PASSWORD
 
 
 def send_email_via_resend(
-    email_message: Union[EmailMessage, EmailMultiAlternatives]
+    email_message: Union[EmailMessage, EmailMultiAlternatives],
 ) -> Dict[str, Any]:
     """
     Send an email using the Resend API.
@@ -16,7 +16,6 @@ def send_email_via_resend(
     subject = email_message.subject
     from_email = email_message.from_email
     recipients = email_message.to
-
 
     if hasattr(email_message, "alternatives") and email_message.alternatives:
         html_content = email_message.alternatives[0][0]
@@ -33,6 +32,17 @@ def send_email_via_resend(
             "subject": subject,
             "text": email_message.body,
         }
+
+    reply_to = email_message.reply_to or next(
+        (
+            value
+            for key, value in email_message.extra_headers.items()
+            if key.lower() == "reply-to"
+        ),
+        None,
+    )
+    if reply_to:
+        params["reply_to"] = reply_to
 
     response = resend.Emails.send(params)
     return response

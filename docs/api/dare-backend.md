@@ -20,6 +20,41 @@ Authorization: Bearer <access_token>
 
 Tokens are obtained via `POST /users/api/dj-rest-auth/login/` and refreshed via `POST /users/api/dj-rest-auth/token/refresh/`.
 
+## Access requests and signup invitations
+
+`POST /users/api/access-requests/` is public and rate limited. Send
+`{ "name": "Applicant", "email": "person@example.org", "reason": "Research" }`.
+`reason` is optional (up to 1,000 characters); names are required (up to 255).
+A successful submission returns HTTP 202 with `{ "detail": "..." }` and never
+returns a user, code, request identifier or token. Duplicate requests and existing
+accounts receive the same response. Invalid fields return 400, throttling returns
+429 with Retry-After, and disabled/unconfigured requests return 503.
+
+Administrators review persistent pending requests through Django admin. Approval
+emails a single-use code directly to the applicant. An emailed review link requires
+login as its designated, currently authorized reviewer and an explicit CSRF-protected
+POST; GET only displays the confirmation. The admin policy can disable email approval.
+These links are not public API credentials. See [the administrator guide](../admin-guide.md#access-requests-and-automated-invitations).
+
+`POST /users/api/dj-rest-auth/registration/` accepts an optional `accessCode` for all
+client origins. A supplied invalid, disabled, expired or exhausted code returns 400.
+Valid codes retain their role, wallet and model-group behavior and are consumed
+transactionally. Missing/blank codes require enabled access-request settings and
+create an inactive USER account plus an administrator-review request. Registration
+returns a notice and `approvalRequired` (true for this path), never login tokens.
+Email verification and administrator approval are both required for code-free users,
+in either order; the second completed gate activates the account once.
+Approval before verification queues a separate approval email with instructions to
+verify before signing in; activation queues the account-ready email. Each delivery
+has visible state and can use the administrator retry action after a failure.
+An existing approved invitation without a supplied code returns an actionable
+`accessCode` error directing the applicant to their emailed invitation.
+Verification
+returns `approvalRequired` when review remains pending and issues no tokens for
+inactive users. Both paths return 503 without creating an account or consuming a
+code if mandatory email verification is disabled. The no-code path does not grant staff/superuser privileges. Generated
+invitation expiry applies until redemption; legacy group expiry remains unchanged.
+
 ## API Overview
 
 | Module | Base Path | Description |

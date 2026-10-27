@@ -12,6 +12,9 @@ https://docs.djangoproject.com/en/5.1/ref/settings/
 
 import os
 from datetime import timedelta
+
+from django.core.exceptions import ImproperlyConfigured
+
 from config import env
 from config.sentry import init_sentry
 
@@ -34,9 +37,15 @@ DARE_INTERNAL_KEY = env.DARE_INTERNAL_KEY
 # finalize_ai_message uses the legacy path (User.billing_mode lookup only);
 # bot-attribution columns are still written. When True, the bot router
 # applies the chatter-pays / anonymous-falls-back-to-owner rule.
-BOT_WALLET_ENFORCEMENT_ENABLED = bool(int(os.environ.get(
-    'BOT_WALLET_ENFORCEMENT_ENABLED', '0',
-) or '0'))
+BOT_WALLET_ENFORCEMENT_ENABLED = bool(
+    int(
+        os.environ.get(
+            "BOT_WALLET_ENFORCEMENT_ENABLED",
+            "0",
+        )
+        or "0"
+    )
+)
 
 DJANGO_APPS = [
     "django.contrib.admin",
@@ -118,7 +127,9 @@ TEMPLATES = [
 ]
 
 AUTH_PASSWORD_VALIDATORS = [
-    {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
+    {
+        "NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"
+    },
     {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator"},
     {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator"},
     {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
@@ -140,16 +151,40 @@ EMAIL_HOST_USER = env.EMAIL_HOST_USER
 EMAIL_HOST_PASSWORD = env.EMAIL_HOST_PASSWORD
 EMAIL_FROM = env.EMAIL_FROM
 DEFAULT_FROM_EMAIL = EMAIL_FROM
-EMAIL_PORT = env.EMAIL_PORT
+EMAIL_REPLY_TO = os.environ.get("EMAIL_REPLY_TO", "").strip()
+EMAIL_PORT = int(env.EMAIL_PORT or 587)
+EMAIL_USE_TLS = env.EMAIL_USE_TLS
+EMAIL_USE_SSL = env.EMAIL_USE_SSL
+EMAIL_TIMEOUT = int(os.environ.get("EMAIL_TIMEOUT", "10"))
 
-if env.EMAIL_HOST_USER and env.EMAIL_HOST_PASSWORD:
+if os.environ.get("EMAIL_BACKEND"):
+    EMAIL_BACKEND = os.environ["EMAIL_BACKEND"]
+elif env.EMAIL_HOST_USER and env.EMAIL_HOST_PASSWORD:
     EMAIL_BACKEND = "email_logs.backends.LoggingResendEmailBackend"
 elif env.EMAIL_HOST:
     EMAIL_BACKEND = "email_logs.backends.LoggingSMTPEmailBackend"
 else:
     EMAIL_BACKEND = "email_logs.backends.LoggingConsoleEmailBackend"
 
+EMAIL_BACKEND = {
+    "django.core.mail.backends.console.EmailBackend": "email_logs.backends.LoggingConsoleEmailBackend",
+    "django.core.mail.backends.smtp.EmailBackend": "email_logs.backends.LoggingSMTPEmailBackend",
+}.get(EMAIL_BACKEND, EMAIL_BACKEND)
+
+SESSION_COOKIE_SECURE = os.environ.get("DJANGO_SECURE_COOKIES", "False") == "True"
+CSRF_COOKIE_SECURE = SESSION_COOKIE_SECURE
+SECURE_PROXY_SSL_HEADER = (
+    ("HTTP_X_FORWARDED_PROTO", "https")
+    if os.environ.get("TRUST_PROXY_HTTPS", "False") == "True"
+    else None
+)
+
+TRUSTED_PROXY_COUNT = int(os.environ.get("TRUSTED_PROXY_COUNT", "0"))
+if TRUSTED_PROXY_COUNT < 0:
+    raise ImproperlyConfigured("TRUSTED_PROXY_COUNT must be nonnegative.")
+
 REST_FRAMEWORK = {
+    "NUM_PROXIES": TRUSTED_PROXY_COUNT,
     "DEFAULT_RENDERER_CLASSES": (
         "djangorestframework_camel_case.render.CamelCaseJSONRenderer",
         "djangorestframework_camel_case.render.CamelCaseBrowsableAPIRenderer",
@@ -164,10 +199,16 @@ REST_FRAMEWORK = {
         "rest_framework_simplejwt.authentication.JWTAuthentication",
     ],
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
-    "PAGE_SIZE": 500, # TODO: temporarily increasing page size, until we add pagination on FE
+    "PAGE_SIZE": 500,  # TODO: temporarily increasing page size, until we add pagination on FE
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
     "JSON_UNDERSCOREIZE": {
-        "ignore_keys": ("password1", "password2", "new_password1", "new_password2", "old_password"),
+        "ignore_keys": (
+            "password1",
+            "password2",
+            "new_password1",
+            "new_password2",
+            "old_password",
+        ),
         # Preserve dict keys under these fields from camelCase conversion.
         # nodeStates is a dict keyed by user-generated node IDs (e.g. '-ybkjiGpAUdvp01WwZodV_9')
         # that contain underscores — camelize() would mangle them without this.
@@ -330,7 +371,11 @@ CHANNEL_LAYERS = {
         "BACKEND": "channels_redis.core.RedisChannelLayer",
         "CONFIG": {
             "hosts": [
-                f"redis://:{REDIS_PASSWORD}@{REDIS_HOST}:{REDIS_PORT}/{REDIS_DB}" if REDIS_PASSWORD else f"redis://{REDIS_HOST}:{REDIS_PORT}/{REDIS_DB}"
+                (
+                    f"redis://:{REDIS_PASSWORD}@{REDIS_HOST}:{REDIS_PORT}/{REDIS_DB}"
+                    if REDIS_PASSWORD
+                    else f"redis://{REDIS_HOST}:{REDIS_PORT}/{REDIS_DB}"
+                )
             ],
         },
     }
@@ -348,35 +393,35 @@ RQ = {
 }
 
 RQ_QUEUES = {
-    'default': {
-        'HOST': REDIS_HOST,
-        'PORT': REDIS_PORT,
-        'DB': REDIS_DB,
-        'PASSWORD': REDIS_PASSWORD if REDIS_PASSWORD else None,
-        'DEFAULT_TIMEOUT': 3600,
+    "default": {
+        "HOST": REDIS_HOST,
+        "PORT": REDIS_PORT,
+        "DB": REDIS_DB,
+        "PASSWORD": REDIS_PASSWORD if REDIS_PASSWORD else None,
+        "DEFAULT_TIMEOUT": 3600,
         # Keep long-idle workers alive between document uploads.
-        'REDIS_CLIENT_KWARGS': {
-            'socket_keepalive': True,
-            'health_check_interval': 30,
+        "REDIS_CLIENT_KWARGS": {
+            "socket_keepalive": True,
+            "health_check_interval": 30,
         },
     },
-    'scheduler': {
-        'HOST': REDIS_HOST,
-        'PORT': REDIS_PORT,
-        'DB': REDIS_DB,
-        'PASSWORD': REDIS_PASSWORD if REDIS_PASSWORD else None,
+    "scheduler": {
+        "HOST": REDIS_HOST,
+        "PORT": REDIS_PORT,
+        "DB": REDIS_DB,
+        "PASSWORD": REDIS_PASSWORD if REDIS_PASSWORD else None,
     },
     # Use one worker until memory writes are serialized per user.
-    'memory': {
-        'HOST': REDIS_HOST,
-        'PORT': REDIS_PORT,
-        'DB': REDIS_DB,
-        'PASSWORD': REDIS_PASSWORD if REDIS_PASSWORD else None,
-        'DEFAULT_TIMEOUT': 300,
+    "memory": {
+        "HOST": REDIS_HOST,
+        "PORT": REDIS_PORT,
+        "DB": REDIS_DB,
+        "PASSWORD": REDIS_PASSWORD if REDIS_PASSWORD else None,
+        "DEFAULT_TIMEOUT": 300,
         # Keep idle Redis connections healthy.
-        'REDIS_CLIENT_KWARGS': {
-            'socket_keepalive': True,
-            'health_check_interval': 30,
+        "REDIS_CLIENT_KWARGS": {
+            "socket_keepalive": True,
+            "health_check_interval": 30,
         },
     },
 }
@@ -402,19 +447,19 @@ DATA_UPLOAD_MAX_MEMORY_SIZE = 104857600  # 100MB in bytes
 FILE_UPLOAD_MAX_MEMORY_SIZE = 104857600  # 100MB in bytes
 
 WEAVIATE = {
-    'HOST': env.WEAVIATE_HOST,
-    'PORT': env.WEAVIATE_PORT,
-    'GRPC_PORT': env.WEAVIATE_GRPC_PORT,
-    'COLLECTION_NAME': env.WEAVIATE_COLLECTION_NAME,
-    'SKIP_INIT_CHECKS': env.WEAVIATE_SKIP_INIT_CHECKS,
-    'AUTOSCHEMA_ENABLED': env.WEAVIATE_AUTOSCHEMA_ENABLED
+    "HOST": env.WEAVIATE_HOST,
+    "PORT": env.WEAVIATE_PORT,
+    "GRPC_PORT": env.WEAVIATE_GRPC_PORT,
+    "COLLECTION_NAME": env.WEAVIATE_COLLECTION_NAME,
+    "SKIP_INIT_CHECKS": env.WEAVIATE_SKIP_INIT_CHECKS,
+    "AUTOSCHEMA_ENABLED": env.WEAVIATE_AUTOSCHEMA_ENABLED,
 }
 
 # SyftBox Settings (distributed file storage)
 SYFTBOX = {
-    'ENABLED': env.SYFTBOX_ENABLED,
-    'DATASITES_ROOT': env.SYFTBOX_DATASITES_ROOT,
-    'APP_NAME': env.SYFTBOX_APP_NAME,
+    "ENABLED": env.SYFTBOX_ENABLED,
+    "DATASITES_ROOT": env.SYFTBOX_DATASITES_ROOT,
+    "APP_NAME": env.SYFTBOX_APP_NAME,
 }
 
 # Hermes agent runtime (delegated research-agent runtime for Research Mode)
