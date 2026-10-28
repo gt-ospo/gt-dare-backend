@@ -1,13 +1,11 @@
-from django.conf import settings
 from django.core.mail.backends.base import BaseEmailBackend
-from django.core.mail.backends.console import EmailBackend as ConsoleEmailBackend
 from django.core.mail.backends.smtp import EmailBackend as SMTPEmailBackend
+from django.core.mail.backends.console import EmailBackend as ConsoleEmailBackend
 from django.core.mail.message import EmailMessage
 from django.utils import timezone
-
 from core.helpers.resend_email import send_email_via_resend
-
 from .models import EmailLog
+from django.conf import settings
 
 
 class LoggingEmailBackendMixin:
@@ -72,7 +70,6 @@ class LoggingSMTPEmailBackend(LoggingEmailBackendMixin, SMTPEmailBackend):
     """
     A custom email backend that logs emails to the EmailLog model before sending via SMTP.
     """
-
     pass
 
 
@@ -80,7 +77,6 @@ class LoggingConsoleEmailBackend(LoggingEmailBackendMixin, ConsoleEmailBackend):
     """
     A custom email backend that logs emails to the EmailLog model before sending via console.
     """
-
     pass
 
 
@@ -88,7 +84,6 @@ class LoggingResendEmailBackend(LoggingEmailBackendMixin, BaseEmailBackend):
     """
     A custom email backend that logs emails to the EmailLog model and sends them via Resend API.
     """
-
     def send_messages(self, email_messages):
         """
         Send one or more EmailMessage objects and return the number of email messages sent.
