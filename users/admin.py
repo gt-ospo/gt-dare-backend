@@ -26,6 +26,7 @@ from users.admin_constants import (
     ACTIVITY_NEVER_STATE,
 )
 from core.helpers.admin_utils import render_span, render_status_badge
+from users import access_request_admin  # noqa: F401
 
 
 class UserInline(admin.TabularInline):

@@ -1,0 +1,26 @@
+{% extends "admin/base_site.html" %}
+{% load i18n %}
+{% block content %}
+{% if unavailable %}
+<p>{% translate "This request has already been reviewed, email approval is unavailable, or the link is no longer valid. Open Access requests in Django admin to review current status." %}</p>
+{% else %}
+<dl>
+  <dt>{% translate "Name" %}</dt><dd>{{ access_request.name }}</dd>
+  <dt>{% translate "Email" %}</dt><dd>{{ access_request.email }}</dd>
+  <dt>{% translate "Reason" %}</dt><dd>{{ access_request.reason|linebreaksbr }}</dd>
+  <dt>{% translate "Status" %}</dt><dd>{{ access_request.get_status_display }}</dd>
+</dl>
+{% if can_decide %}
+{% if access_request.registered_user_id %}
+<p>{% translate "Approval allows this registered USER account to activate after email verification. It does not grant administrator permissions or verify email ownership." %}</p>
+{% else %}
+<p>{% translate "Approval creates a single-use USER invitation and emails it to this applicant. It does not create an administrator account or verify email ownership." %}</p>
+{% endif %}
+<form method="post">
+  {% csrf_token %}
+  <button type="submit" name="decision" value="approve">{% translate "Approve request" %}</button>
+  <button type="submit" name="decision" value="decline">{% translate "Decline request" %}</button>
+</form>
+{% endif %}
+{% endif %}
+{% endblock %}

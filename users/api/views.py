@@ -26,6 +26,8 @@ from conversations.constants import SenderType
 from conversations.models import Conversation, Message
 from files.models import File
 from prompts.models import Prompt
+from users.access_request_constants import RequestState
+from users.access_request_models import AccessRequest
 from users.constants import (
     VOICE_ACCESS_CODE_CAPACITY,
     AccessCodeProvisionerChoice,
@@ -99,13 +101,24 @@ class CustomVerifyEmailView(VerifyEmailView):
 
         # Get the user from the confirmation
         user = confirmation.email_address.user
+        user.refresh_from_db(fields=["is_active"])
 
         # Prepare response
-        response_data = {"detail": "ok"}
+        pending = AccessRequest.objects.filter(
+            registered_user=user, status=RequestState.PENDING
+        ).exists()
+        response_data = {
+            "detail": (
+                "Email verified. Administrator approval is still required."
+                if pending
+                else "ok"
+            ),
+            "approval_required": pending,
+        }
 
         # Only generate JWT tokens for DARE users (auto-login)
         # Socratic Bots users will be redirected to their frontend where these tokens wouldn't be accessible
-        if user.auth_source == AuthSourceChoice.DARE:
+        if user.auth_source == AuthSourceChoice.DARE and user.is_active:
             refresh = RefreshToken.for_user(user)
             response_data["access"] = str(refresh.access_token)
             response_data["refresh"] = str(refresh)
