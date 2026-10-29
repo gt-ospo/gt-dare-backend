@@ -284,8 +284,23 @@ def decide_request(request_id, *, actor, approve, email_token=None):
     return True
 
 
+def review_cc(delivery):
+    """Copy configured mailboxes once per request, unless they already review it."""
+    reviews = delivery.request.deliveries.filter(kind=DeliveryKind.REVIEW)
+    if reviews.order_by("pk").values_list("pk", flat=True).first() != delivery.pk:
+        return []
+    seen = {r.lower() for r in reviews.values_list("recipient", flat=True)}
+    cc = []
+    for address in settings.ACCESS_REQUEST_REVIEW_CC:
+        if address.lower() not in seen:
+            seen.add(address.lower())
+            cc.append(address)
+    return cc
+
+
 def mail_for(delivery, policy):
     access_request = delivery.request
+    cc = []
     if delivery.kind == DeliveryKind.REVIEW:
         reviewer = delivery.reviewer
         if (
@@ -311,6 +326,8 @@ def mail_for(delivery, policy):
             "reason": access_request.reason,
             "url": policy.admin_base_url.rstrip("/") + path,
         }
+        if access_request.kind == RequestKind.REGISTRATION:
+            cc = review_cc(delivery)
     elif delivery.kind == DeliveryKind.APPROVAL:
         if (
             access_request.kind != RequestKind.REGISTRATION
@@ -353,7 +370,7 @@ def mail_for(delivery, policy):
         body += _(
             "\n\nQuestions? Reply to this email to contact our team at %(email)s."
         ) % {"email": settings.EMAIL_REPLY_TO}
-    message = EmailMessage(str(subject), str(body), to=[delivery.recipient])
+    message = EmailMessage(str(subject), str(body), to=[delivery.recipient], cc=cc)
     message.dare_sensitive = True
     return message
 

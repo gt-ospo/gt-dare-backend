@@ -144,6 +144,11 @@ EMAIL_HOST_PASSWORD = env.EMAIL_HOST_PASSWORD
 EMAIL_FROM = env.EMAIL_FROM
 DEFAULT_FROM_EMAIL = EMAIL_FROM
 EMAIL_REPLY_TO = os.environ.get("EMAIL_REPLY_TO", "").strip()
+ACCESS_REQUEST_REVIEW_CC = [
+    address.strip()
+    for address in os.environ.get("ACCESS_REQUEST_REVIEW_CC", "").split(",")
+    if address.strip()
+]
 EMAIL_PORT = int(env.EMAIL_PORT or 587)
 EMAIL_USE_TLS = env.EMAIL_USE_TLS
 EMAIL_USE_SSL = env.EMAIL_USE_SSL
