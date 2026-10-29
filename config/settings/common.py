@@ -149,6 +149,12 @@ ACCESS_REQUEST_REVIEW_CC = [
     for address in os.environ.get("ACCESS_REQUEST_REVIEW_CC", "").split(",")
     if address.strip()
 ]
+# Explicit full origins only; empty keeps production signup HTTPS-only.
+ACCESS_REQUEST_ALLOWED_HTTP_ORIGINS = [
+    origin.strip().lower().rstrip("/")
+    for origin in os.environ.get("ACCESS_REQUEST_ALLOWED_HTTP_ORIGINS", "").split(",")
+    if origin.strip()
+]
 EMAIL_PORT = int(env.EMAIL_PORT or 587)
 EMAIL_USE_TLS = env.EMAIL_USE_TLS
 EMAIL_USE_SSL = env.EMAIL_USE_SSL

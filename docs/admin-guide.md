@@ -53,8 +53,11 @@ Three options:
 2. A superuser opens **Access request settings** in Django admin. Choose reviewers
    who are active staff with the **Can change access request** permission (or superusers).
    Set the public administrator origin and full signup URL, select any model-group
-   restriction, and enable requests. Production links require HTTPS. HTTP is accepted
-   only for localhost development with DEBUG enabled. On GT, the administrator origin
+   restriction, and enable requests. Production links require HTTPS by default. A
+   VPN/firewall-restricted HTTP deployment must explicitly list its full application
+   and admin origins, including ports, in `ACCESS_REQUEST_ALLOWED_HTTP_ORIGINS`.
+   Other HTTP origins remain rejected; this setting does not add TLS. Localhost
+   development with DEBUG enabled remains supported. On GT, the administrator origin
    must use the separately reachable admin service, not the application-only port.
 3. Enable **Email approval enabled** if reviewers should receive approval links.
    Turning it off immediately blocks previously sent email links. Review through the
@@ -137,6 +140,12 @@ HTTPS/cookies, and Site branding. It does not activate requests or send mail. Us
 `--require-enabled` for the final rollout check. Only an explicit
 `--send-test-to recipient@example.org` sends one diagnostic; a successful submission
 still needs inbox confirmation. Provider/domain authorization is an external prerequisite.
+
+For an explicitly allowlisted HTTP admin origin, retain the existing network
+restrictions and set `DJANGO_SECURE_COOKIES=False`; secure cookies cannot be sent
+on HTTP. Keep `TRUST_PROXY_HTTPS=False` when the ingress does not terminate TLS.
+Approval authentication, CSRF validation, mandatory email verification and all
+role checks remain required in this mode.
 
 For a sanitizing HTTPS proxy, set `TRUST_PROXY_HTTPS=True` to trust its overwritten
 `X-Forwarded-Proto`, and `DJANGO_SECURE_COOKIES=True` to protect session/CSRF cookies.

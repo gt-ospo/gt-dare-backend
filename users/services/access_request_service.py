@@ -62,9 +62,16 @@ def validate_public_url(value, *, origin_only=False):
         "[::1]",
         "::1",
     }
-    if parsed.scheme != "https" and not (local and parsed.scheme == "http"):
+    allowed_http = (
+        parsed.scheme == "http"
+        and f"http://{parsed.netloc.lower()}"
+        in getattr(settings, "ACCESS_REQUEST_ALLOWED_HTTP_ORIGINS", [])
+    )
+    if parsed.scheme != "https" and not (
+        parsed.scheme == "http" and (local or allowed_http)
+    ):
         raise ValidationError(
-            _("Use an HTTPS URL; HTTP is allowed only for local development.")
+            _("Use HTTPS or an explicitly allowlisted HTTP deployment origin.")
         )
     if (
         not parsed.netloc
