@@ -15,6 +15,7 @@ from prompts.models import Prompt
 from api_keys.constants import BillingModeChoice
 from users.access_request_models import (  # noqa: F401
     AccessRequest,
+    AccessRequestDecision,
     AccessRequestDelivery,
     AccessRequestPolicy,
 )

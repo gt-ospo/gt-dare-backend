@@ -28,11 +28,12 @@ class AccessRequestPolicy(models.Model):
     )
     reviewers = models.ManyToManyField(
         settings.AUTH_USER_MODEL,
+        verbose_name=_("Request approvers"),
         blank=True,
         related_name="access_review_policies",
         limit_choices_to={"is_active": True, "is_staff": True},
         help_text=_(
-            "Notify these administrators. Each needs permission to change access requests."
+            "Only these administrators may approve, decline, or change decisions. Each needs permission to change access requests."
         ),
     )
     admin_base_url = models.URLField(
@@ -96,13 +97,13 @@ class AccessRequest(models.Model):
         blank=True,
         on_delete=models.SET_NULL,
         related_name="signup_request",
-        help_text=_("Inactive account awaiting approval and email verification."),
+        help_text=_("Applicant account; access requires approval and email verification."),
     )
     activated_at = models.DateTimeField(
         null=True,
         blank=True,
         help_text=_(
-            "First activation after approval and email verification; later verification never reactivates a disabled account."
+            "Activation under the current approval; decision changes are retained in history."
         ),
     )
     email = models.EmailField(
@@ -140,6 +141,20 @@ class AccessRequest(models.Model):
         related_name="access_request",
         help_text=_("Email-bound, single-use invitation created on approval."),
     )
+    access_managed_in_users = models.BooleanField(
+        db_default=False,
+        default=False,
+        editable=False,
+        verbose_name=_("Access managed in Users"),
+        help_text=_(
+            "Existing administrator access is managed in Users; this request records approval only."
+        ),
+    )
+    decision_version = models.PositiveIntegerField(
+        default=0,
+        editable=False,
+        help_text=_("Version of the current administrator decision."),
+    )
     approval_nonce = models.UUIDField(default=uuid.uuid4, editable=False)
 
     class Meta:
@@ -152,15 +167,16 @@ class AccessRequest(models.Model):
                         reviewed_at__isnull=True,
                         code_group__isnull=True,
                     )
-                    | models.Q(
-                        status=RequestState.APPROVED,
-                        reviewed_at__isnull=False,
-                        code_group__isnull=False,
+                    | (
+                        models.Q(status=RequestState.APPROVED, reviewed_at__isnull=False)
+                        & (
+                            models.Q(code_group__isnull=False)
+                            | models.Q(access_managed_in_users=True)
+                        )
                     )
                     | models.Q(
                         status=RequestState.DECLINED,
                         reviewed_at__isnull=False,
-                        code_group__isnull=True,
                     )
                 ),
                 name="access_request_decision_consistent",
@@ -169,6 +185,45 @@ class AccessRequest(models.Model):
 
     def __str__(self):
         return f"{self.email} ({self.get_status_display()})"
+
+
+class AccessRequestDecision(models.Model):
+    request = models.ForeignKey(
+        AccessRequest,
+        on_delete=models.CASCADE,
+        related_name="decisions",
+        help_text=_("Request whose decision changed."),
+    )
+    version = models.PositiveIntegerField(help_text=_("Saved decision version."))
+    previous_status = models.CharField(
+        max_length=10,
+        choices=RequestState.choices,
+        help_text=_("Status before this decision."),
+    )
+    status = models.CharField(
+        max_length=10,
+        choices=RequestState.choices,
+        help_text=_("Status after this decision."),
+    )
+    reviewer = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        on_delete=models.SET_NULL,
+        related_name="access_request_decisions",
+        help_text=_("Administrator who saved this decision."),
+    )
+    decided_at = models.DateTimeField(
+        auto_now_add=True, help_text=_("Decision timestamp.")
+    )
+
+    class Meta:
+        ordering = ["version"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["request", "version"],
+                name="unique_access_request_decision_version",
+            )
+        ]
 
 
 class AccessRequestDelivery(models.Model):
@@ -181,7 +236,12 @@ class AccessRequestDelivery(models.Model):
     kind = models.CharField(
         max_length=10,
         choices=DeliveryKind.choices,
-        help_text=_("Review, invitation, approval, or account-ready notification."),
+        help_text=_("Review, invitation, approval, account-ready, or decline notification."),
+    )
+    decision_version = models.PositiveIntegerField(
+        default=0,
+        editable=False,
+        help_text=_("Decision this notification describes."),
     )
     recipient = models.EmailField(help_text=_("Intended email recipient."))
     reviewer = models.ForeignKey(
@@ -216,8 +276,8 @@ class AccessRequestDelivery(models.Model):
         verbose_name_plural = _("Access request deliveries")
         constraints = [
             models.UniqueConstraint(
-                fields=["request", "kind", "recipient"],
-                name="unique_access_request_delivery",
+                fields=["request", "kind", "recipient", "decision_version"],
+                name="unique_access_request_delivery_decision",
             )
         ]
 

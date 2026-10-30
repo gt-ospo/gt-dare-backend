@@ -14,6 +14,7 @@ from django.utils.translation import gettext_lazy as _
 from users.access_request_constants import DeliveryState, RequestState
 from users.access_request_models import (
     AccessRequest,
+    AccessRequestDecision,
     AccessRequestDelivery,
     AccessRequestPolicy,
 )
@@ -82,6 +83,7 @@ class DeliveryInline(admin.TabularInline):
     fields = [
         "kind",
         "recipient",
+        "decision_version",
         "state",
         "attempts",
         "attempted_at",
@@ -95,6 +97,30 @@ class DeliveryInline(admin.TabularInline):
     def has_add_permission(self, request, obj=None):
         return False
 
+    def has_view_permission(self, request, obj=None):
+        return request.user.has_perm("users.view_accessrequest") or request.user.has_perm(
+            "users.change_accessrequest"
+        )
+
+
+class DecisionInline(admin.TabularInline):
+    model = AccessRequestDecision
+    fields = ["version", "previous_status", "status", "reviewer", "decided_at"]
+    readonly_fields = fields
+    extra = 0
+    can_delete = False
+
+    def has_add_permission(self, request, obj=None):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_view_permission(self, request, obj=None):
+        return request.user.has_perm(
+            "users.view_accessrequest"
+        ) or request.user.has_perm("users.change_accessrequest")
+
 
 @admin.register(AccessRequest)
 class AccessRequestAdmin(admin.ModelAdmin):
@@ -103,6 +129,7 @@ class AccessRequestAdmin(admin.ModelAdmin):
         "kind",
         "name",
         "status",
+        "review_request",
         "created_at",
         "reviewed_by",
         "delivery_status",
@@ -112,6 +139,7 @@ class AccessRequestAdmin(admin.ModelAdmin):
     fields = [
         "kind",
         "registered_user",
+        "access_managed_in_users",
         "activated_at",
         "name",
         "email",
@@ -124,7 +152,7 @@ class AccessRequestAdmin(admin.ModelAdmin):
         "code_group",
     ]
     readonly_fields = fields
-    inlines = [DeliveryInline]
+    inlines = [DecisionInline, DeliveryInline]
     actions = ["approve_requests", "decline_requests", "retry_emails"]
 
     def has_add_permission(self, request):
@@ -133,14 +161,43 @@ class AccessRequestAdmin(admin.ModelAdmin):
     def has_delete_permission(self, request, obj=None):
         return False
 
+    def has_change_permission(self, request, obj=None):
+        return (
+            super().has_change_permission(request, obj)
+            and AccessRequestPolicy.objects.filter(pk=1, reviewers=request.user).exists()
+        )
+
     @admin.display(description=_("Review request"))
     def review_request(self, obj):
-        if obj.status != RequestState.PENDING:
-            return obj.get_status_display()
+        pending = obj.status == RequestState.PENDING
+        if obj.access_managed_in_users and not pending:
+            if not obj.registered_user_id:
+                return _("Account deleted; request retained")
+            return format_html(
+                '<a href="{}">{}</a>',
+                reverse("admin:users_user_change", args=[obj.registered_user_id]),
+                _("Manage in Users"),
+            )
         return format_html(
             '<a href="{}">{}</a>',
-            reverse("admin:users_accessrequest_review", args=[obj.pk]),
-            _("Approve or decline"),
+            reverse(
+                (
+                    "admin:users_accessrequest_review"
+                    if pending
+                    else "admin:users_accessrequest_revise"
+                ),
+                args=[obj.pk],
+            ),
+            (
+                (
+                    _("Record existing admin approval")
+                    if obj.registered_user_id
+                    and (obj.registered_user.is_staff or obj.registered_user.is_superuser)
+                    else _("Approve or decline")
+                )
+                if pending
+                else _("Change decision")
+            ),
         )
 
     @admin.display(description=_("Email delivery"))
@@ -155,6 +212,12 @@ class AccessRequestAdmin(admin.ModelAdmin):
     def get_urls(self):
         return [
             path(
+                "revise/<int:request_id>/",
+                self.admin_site.admin_view(self.review),
+                {"revise": True},
+                name="users_accessrequest_revise",
+            ),
+            path(
                 "review/<int:request_id>/",
                 self.admin_site.admin_view(self.review),
                 name="users_accessrequest_review",
@@ -166,7 +229,7 @@ class AccessRequestAdmin(admin.ModelAdmin):
             ),
         ] + super().get_urls()
 
-    def review(self, request, request_id=None, token=None):
+    def review(self, request, request_id=None, token=None, revise=False):
         if not self.has_change_permission(request):
             raise PermissionDenied
         try:
@@ -197,14 +260,26 @@ class AccessRequestAdmin(admin.ModelAdmin):
             decision = request.POST.get("decision")
             if decision not in {"approve", "decline"}:
                 return HttpResponseBadRequest(_("Choose approve or decline."))
+            expected_version = None
+            if revise:
+                try:
+                    expected_version = int(request.POST.get("decision_version", ""))
+                except (TypeError, ValueError):
+                    return HttpResponseBadRequest(
+                        _("Reload the request before changing its decision.")
+                    )
             try:
                 changed = decide_request(
                     obj.pk,
                     actor=request.user,
                     approve=decision == "approve",
                     email_token=token,
+                    revise=revise,
+                    expected_version=expected_version,
                 )
-            except (AccessRequestsUnavailable, ValidationError, RequestAlreadyReviewed):
+            except ValidationError as error:
+                self.message_user(request, " ".join(error.messages), messages.ERROR)
+            except (AccessRequestsUnavailable, RequestAlreadyReviewed):
                 self.message_user(
                     request,
                     _(
@@ -228,9 +303,26 @@ class AccessRequestAdmin(admin.ModelAdmin):
             "admin/users/accessrequest/review.html",
             {
                 **self.admin_site.each_context(request),
-                "title": _("Review access request"),
+                "title": (
+                    _("Change access decision") if revise else _("Review access request")
+                ),
                 "access_request": obj,
-                "can_decide": obj.status == RequestState.PENDING,
+                "revising": revise,
+                "admin_account": obj.access_managed_in_users
+                or bool(
+                    obj.registered_user_id
+                    and (obj.registered_user.is_staff or obj.registered_user.is_superuser)
+                ),
+                "user_admin_url": (
+                    reverse("admin:users_user_change", args=[obj.registered_user_id])
+                    if obj.registered_user_id
+                    else ""
+                ),
+                "can_decide": (
+                    (obj.status != RequestState.PENDING)
+                    if revise
+                    else (obj.status == RequestState.PENDING)
+                ),
             },
         )
         # Preserve same-origin CSRF checks without leaking review links off-site.
@@ -241,6 +333,13 @@ class AccessRequestAdmin(admin.ModelAdmin):
 
     def decide_selected(self, request, queryset, *, approve):
         count = 0
+        for obj in queryset.exclude(status=RequestState.PENDING):
+            self.message_user(
+                request,
+                format_html(_("{} is already reviewed. Use {} to change the decision."),
+                            obj.email, format_html('<a href="{}">{}</a>', reverse("admin:users_accessrequest_revise", args=[obj.pk]), _("Change decision"))),
+                messages.WARNING,
+            )
         for obj in queryset.filter(status=RequestState.PENDING):
             try:
                 if decide_request(obj.pk, actor=request.user, approve=approve):
@@ -254,25 +353,18 @@ class AccessRequestAdmin(admin.ModelAdmin):
                         ),
                     )
                     count += 1
-            except (AccessRequestsUnavailable, ValidationError):
-                self.message_user(
-                    request,
-                    _(
-                        "A request could not be reviewed. Check settings and whether the applicant already has an account."
-                    ),
-                    messages.ERROR,
-                )
-        self.message_user(
-            request,
-            _("Saved %(count)s decision(s). Check delivery results for invitations.")
-            % {"count": count},
-        )
+            except ValidationError as error:
+                self.message_user(request, _("%(email)s: %(reason)s") % {"email": obj.email, "reason": " ".join(error.messages)}, messages.ERROR)
+            except AccessRequestsUnavailable:
+                self.message_user(request, _("Access requests are unavailable. Check Access request settings."), messages.ERROR)
+        if count:
+            self.message_user(request, _("Saved %(count)s decision(s). Check delivery results for notifications.") % {"count": count}, messages.SUCCESS)
 
-    @admin.action(description=_("Approve selected requests"), permissions=["change"])
+    @admin.action(description=_("Approve selected pending requests"), permissions=["change"])
     def approve_requests(self, request, queryset):
         self.decide_selected(request, queryset, approve=True)
 
-    @admin.action(description=_("Decline selected requests"), permissions=["change"])
+    @admin.action(description=_("Decline selected pending requests"), permissions=["change"])
     def decline_requests(self, request, queryset):
         self.decide_selected(request, queryset, approve=False)
 

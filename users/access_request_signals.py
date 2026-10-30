@@ -3,7 +3,6 @@
 from allauth.account.signals import email_confirmed
 from django.dispatch import receiver
 
-from users.access_request_constants import RequestKind
 from users.access_request_models import AccessRequest
 from users.services.access_request_service import activate_registration
 
@@ -14,9 +13,7 @@ def activate_approved_registration(sender, request, email_address, **kwargs):
     if email_address.email.lower() != user.email.lower():
         return
     request_id = (
-        AccessRequest.objects.filter(
-            registered_user=user, kind=RequestKind.REGISTRATION
-        )
+        AccessRequest.objects.filter(registered_user=user)
         .values_list("pk", flat=True)
         .first()
     )

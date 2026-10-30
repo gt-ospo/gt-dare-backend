@@ -13,6 +13,7 @@ class DeliveryKind(models.TextChoices):
     INVITATION = "INVITATION", _("Applicant invitation")
     APPROVAL = "APPROVAL", _("Registration approved")
     ACTIVATION = "ACTIVATION", _("Account activated")
+    DECLINE = "DECLINE", _("Request declined")
 
 
 class RequestKind(models.TextChoices):

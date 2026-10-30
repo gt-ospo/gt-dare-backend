@@ -2,6 +2,7 @@
 
 import logging
 import secrets
+import uuid
 from datetime import timedelta
 from functools import partial
 from smtplib import SMTPException
@@ -27,6 +28,7 @@ from users.access_request_constants import (
 )
 from users.access_request_models import (
     AccessRequest,
+    AccessRequestDecision,
     AccessRequestDelivery,
     AccessRequestPolicy,
 )
@@ -111,6 +113,7 @@ def queue_delivery(access_request, kind, recipient, reviewer=None):
         request=access_request,
         kind=kind,
         recipient=recipient,
+        decision_version=access_request.decision_version,
         defaults={"reviewer": reviewer},
     )
     if created:
@@ -163,8 +166,8 @@ def request_registration_approval(user, name):
 def activate_registration(request_id):
     access_request = AccessRequest.objects.select_for_update().get(pk=request_id)
     if (
-        access_request.kind != RequestKind.REGISTRATION
-        or access_request.status != RequestState.APPROVED
+        access_request.status != RequestState.APPROVED
+        or access_request.access_managed_in_users
         or access_request.activated_at
         or not access_request.registered_user_id
     ):
@@ -220,38 +223,83 @@ def resolve_email_review(token, actor):
     return access_request
 
 
-@transaction.atomic
-def decide_request(request_id, *, actor, approve, email_token=None):
-    if (
-        not actor.is_active
-        or not actor.is_staff
-        or not actor.has_perm("users.change_accessrequest")
-    ):
-        raise PermissionDenied
-    policy = active_policy()
-    if email_token:
-        # Serialize a decision with changes to the policy's email-approval switch.
-        AccessRequestPolicy.objects.select_for_update().get(pk=policy.pk)
-        linked_request = resolve_email_review(email_token, actor)
-        if linked_request.pk != request_id:
-            raise PermissionDenied
-    access_request = AccessRequest.objects.select_for_update().get(pk=request_id)
-    if access_request.status != RequestState.PENDING:
-        return False
-    if approve:
-        registration = access_request.kind == RequestKind.REGISTRATION
-        if registration and not access_request.registered_user_id:
-            raise ValidationError(_("The registered account no longer exists."))
+def request_account(access_request):
+    """Lock only the account linked to this request or its redeemed invitation."""
+    if access_request.registered_user_id:
+        return User.objects.select_for_update().get(
+            pk=access_request.registered_user_id
+        )
+    if access_request.code_group_id:
+        return (
+            User.objects.select_for_update()
+            .filter(
+                access_code_group_id=access_request.code_group_id,
+                email__iexact=access_request.email,
+            )
+            .first()
+        )
+    return None
+
+
+def grant_request(access_request, policy, user, *, actor):
+    if user and user.is_deleted:
+        raise ValidationError(_("Manage deleted accounts through user administration."))
+    if user and (user.is_staff or user.is_superuser):
+        if not actor.is_superuser:
+            raise ValidationError(
+                _(
+                    "Only a superuser can record approval for an existing administrator account."
+                )
+            )
         if (
-            not registration
-            and User.objects.filter(email__iexact=access_request.email).exists()
+            not user.is_active
+            or not EmailAddress.objects.filter(
+                user=user, email__iexact=user.email, verified=True
+            ).exists()
         ):
             raise ValidationError(
                 _(
-                    "An account already exists for this applicant. Review the account instead."
+                    "This administrator account must already be active and email-verified. Manage it in Users first."
                 )
             )
-        access_request.code_group = AccessCodeGroup.objects.create(
+        # Record the existing grant; never replace its roles, flags or access group.
+        access_request.access_managed_in_users = True
+        access_request.registered_user = user
+        access_request.activated_at = timezone.now()
+        return
+    if access_request.access_managed_in_users:
+        raise ValidationError(
+            _("This account's access is managed in Users. Review the account there.")
+        )
+    registration = access_request.kind == RequestKind.REGISTRATION or user is not None
+    if registration and user is None:
+        raise ValidationError(_("The registered account no longer exists."))
+    if (
+        not registration
+        and User.objects.filter(email__iexact=access_request.email).exists()
+    ):
+        raise ValidationError(
+            _(
+                "An account already exists for this applicant. Review the account instead."
+            )
+        )
+    group = access_request.code_group
+    if group and group.current_usage and user is None:
+        raise ValidationError(
+            _(
+                "The account created from this invitation no longer exists. Review the account instead."
+            )
+        )
+    if group:
+        # Bypass the legacy group signal: reapproval must not bypass email verification.
+        AccessCodeGroup.objects.filter(pk=group.pk).update(is_active=True)
+        group.is_active = True
+        if not registration:
+            group.access_code = secrets.token_urlsafe(32)
+            group.expires_at = timezone.now() + timedelta(days=policy.invitation_days)
+            group.save(update_fields=["access_code", "expires_at"])
+    else:
+        group = AccessCodeGroup.objects.create(
             access_code=secrets.token_urlsafe(32),
             max_capacity=1,
             default_role=RoleChoice.USER,
@@ -263,23 +311,126 @@ def decide_request(request_id, *, actor, approve, email_token=None):
             ),
             notes=_("Generated by administrator approval of an access request."),
         )
+        access_request.code_group = group
         if registration:
-            # Attach a consumed USER group for existing model-access controls,
-            # without requiring or emailing a signup code to the applicant.
-            user = User.objects.select_for_update().get(
-                pk=access_request.registered_user_id
-            )
-            access_request.code_group.use_code()
-            user.access_code_group = access_request.code_group
+            group.use_code()
+            user.access_code_group = group
             user.save(update_fields=["access_code_group"])
-    access_request.status = RequestState.APPROVED if approve else RequestState.DECLINED
+    if user:
+        if user.access_code_group_id != group.pk:
+            raise ValidationError(
+                _(
+                    "The applicant's account access has changed. Review the account instead."
+                )
+            )
+        access_request.registered_user = user
+
+
+@transaction.atomic
+def decide_request(
+    request_id, *, actor, approve, email_token=None, revise=False, expected_version=None
+):
+    if (
+        not actor.is_active
+        or not actor.is_staff
+        or not actor.has_perm("users.change_accessrequest")
+    ):
+        raise PermissionDenied
+    if revise and email_token:
+        raise PermissionDenied
+    # Serialize decisions with changes to the configured approver membership.
+    if not AccessRequestPolicy.objects.select_for_update().filter(pk=1).exists():
+        raise AccessRequestsUnavailable
+    policy = active_policy()
+    if actor.pk not in {u.pk for u in reviewers_for(policy)}:
+        raise PermissionDenied
+    if email_token:
+        linked_request = resolve_email_review(email_token, actor)
+        if linked_request.pk != request_id:
+            raise PermissionDenied
+    access_request = AccessRequest.objects.select_for_update().get(pk=request_id)
+    target = RequestState.APPROVED if approve else RequestState.DECLINED
+    if revise:
+        if (
+            access_request.status == RequestState.PENDING
+            or expected_version != access_request.decision_version
+        ):
+            raise ValidationError(
+                _("The decision changed. Reload the request before trying again.")
+            )
+        if access_request.status == target:
+            return False
+    elif access_request.status != RequestState.PENDING:
+        return False
+    previous_status = access_request.status
+    if access_request.code_group_id:
+        access_request.code_group = AccessCodeGroup.objects.select_for_update().get(
+            pk=access_request.code_group_id
+        )
+    user = request_account(access_request)
+    if approve:
+        grant_request(access_request, policy, user, actor=actor)
+    else:
+        if access_request.access_managed_in_users:
+            raise ValidationError(
+                _(
+                    "This account's access is managed in Users. Disable it there rather than changing its signup decision."
+                )
+            )
+        if user:
+            if user.is_staff or user.is_superuser:
+                raise ValidationError(
+                    _("Manage administrator accounts through user administration.")
+                )
+            if (
+                access_request.code_group_id
+                and user.access_code_group_id != access_request.code_group_id
+            ):
+                raise ValidationError(
+                    _(
+                        "The applicant's account access has changed. Review the account instead."
+                    )
+                )
+            user.is_active = False
+            user.save(update_fields=["is_active"])
+            access_request.registered_user = user
+        if access_request.code_group_id:
+            AccessCodeGroup.objects.filter(pk=access_request.code_group_id).update(
+                is_active=False
+            )
+        access_request.activated_at = None
+    access_request.status = target
     access_request.reviewed_by = actor
     access_request.reviewed_at = timezone.now()
+    access_request.decision_version += 1
+    if revise:
+        access_request.approval_nonce = uuid.uuid4()
     access_request.save(
-        update_fields=["code_group", "status", "reviewed_by", "reviewed_at"]
+        update_fields=[
+            "code_group",
+            "access_managed_in_users",
+            "registered_user",
+            "activated_at",
+            "status",
+            "reviewed_by",
+            "reviewed_at",
+            "decision_version",
+            "approval_nonce",
+        ]
+    )
+    AccessRequestDecision.objects.create(
+        request=access_request,
+        version=access_request.decision_version,
+        previous_status=previous_status,
+        status=target,
+        reviewer=actor,
     )
     if approve:
-        if access_request.kind == RequestKind.REGISTRATION:
+        if access_request.access_managed_in_users:
+            queue_delivery(
+                access_request, DeliveryKind.ACTIVATION, access_request.email
+            )
+        elif access_request.registered_user_id:
             if not activate_registration(access_request.pk):
                 queue_delivery(
                     access_request, DeliveryKind.APPROVAL, access_request.email
@@ -288,6 +439,8 @@ def decide_request(request_id, *, actor, approve, email_token=None):
             queue_delivery(
                 access_request, DeliveryKind.INVITATION, access_request.email
             )
+    else:
+        queue_delivery(access_request, DeliveryKind.DECLINE, access_request.email)
     return True
 
 
@@ -307,6 +460,11 @@ def review_cc(delivery):
 
 def mail_for(delivery, policy):
     access_request = delivery.request
+    if (
+        delivery.kind != DeliveryKind.REVIEW
+        and delivery.decision_version != access_request.decision_version
+    ):
+        raise ValidationError("decision_superseded")
     cc = []
     if delivery.kind == DeliveryKind.REVIEW:
         reviewer = delivery.reviewer
@@ -325,20 +483,43 @@ def mail_for(delivery, policy):
                 args=[approval_token(access_request, reviewer)],
             )
         subject = _("DARE access request awaiting review")
-        body = _(
-            "Name: %(name)s\nEmail: %(email)s\nReason: %(reason)s\n\nReview this request: %(url)s\nSign in as the administrator receiving this message. Opening the link does not approve the request."
-        ) % {
-            "name": access_request.name,
-            "email": access_request.email,
-            "reason": access_request.reason,
-            "url": policy.admin_base_url.rstrip("/") + path,
+        introduction = _("A visitor has requested an invitation to sign up.")
+        reason = _("Reason for access: %(reason)s\n") % {
+            "reason": access_request.reason.strip() or _("Not provided.")
         }
         if access_request.kind == RequestKind.REGISTRATION:
+            introduction = _("A new user has registered and is awaiting your approval.")
+            reason = ""
+        body = _(
+            "Hello %(reviewer)s,\n\n%(introduction)s\n\nName: %(name)s\nEmail: %(email)s\n%(reason)s\nReview and approve or decline this request:\n%(url)s\n\nSign in as the administrator receiving this message. Opening the link does not approve the request."
+        ) % {
+            "reviewer": reviewer.get_full_name().strip() or reviewer.email,
+            "introduction": introduction,
+            "name": access_request.name,
+            "email": access_request.email,
+            "reason": reason,
+            "url": policy.admin_base_url.rstrip("/") + path,
+        }
+        if policy.email_approval_enabled:
+            body += _(
+                "\n\nThis email-review link is assigned to %(reviewer)s. Other configured approvers can review with their own administrator account in Django admin:\n%(url)s"
+            ) % {
+                "reviewer": reviewer.email,
+                "url": policy.admin_base_url.rstrip("/")
+                + reverse("admin:users_accessrequest_change", args=[access_request.pk]),
+            }
+        if access_request.kind == RequestKind.REGISTRATION:
             cc = review_cc(delivery)
+    elif delivery.kind == DeliveryKind.DECLINE:
+        if access_request.status != RequestState.DECLINED:
+            raise ValidationError("request_not_declined")
+        subject = _("Your DARE access request has been declined")
+        body = _(
+            "Hello %(name)s,\n\nYour request for access to DARE has been declined following administrator review.\n\nReason: We are unable to grant access at this time.\n\nIf you believe this was a mistake, contact your deployment administrator to request a review."
+        ) % {"name": access_request.name}
     elif delivery.kind == DeliveryKind.APPROVAL:
         if (
-            access_request.kind != RequestKind.REGISTRATION
-            or access_request.status != RequestState.APPROVED
+            access_request.status != RequestState.APPROVED
             or not access_request.registered_user_id
             or access_request.registered_user.is_deleted
         ):
@@ -372,6 +553,15 @@ def mail_for(delivery, policy):
             "url": policy.registration_url,
             "code": group.access_code,
             "expires": group.expires_at.isoformat(),
+        }
+    if (
+        access_request.decisions.filter(version=delivery.decision_version)
+        .exclude(previous_status=RequestState.PENDING)
+        .exists()
+        and delivery.kind != DeliveryKind.REVIEW
+    ):
+        subject = _("DARE access decision updated: %(status)s") % {
+            "status": access_request.get_status_display()
         }
     if getattr(settings, "EMAIL_REPLY_TO", ""):
         body += _(

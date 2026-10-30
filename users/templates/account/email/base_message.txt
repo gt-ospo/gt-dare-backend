@@ -1,4 +1,4 @@
-{% load i18n %}{% autoescape off %}{% blocktranslate with site_name=current_site.name %}Hello from {{ site_name }},{% endblocktranslate %}
+{% load i18n %}{% autoescape off %}{% if user %}{% blocktranslate with recipient_name=user.get_full_name|default:user.email %}Hello {{ recipient_name }},{% endblocktranslate %}{% else %}{% translate "Hello," %}{% endif %}
 
 {% block content %}{% endblock content %}
 {% if support_email %}
