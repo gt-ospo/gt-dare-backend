@@ -54,6 +54,16 @@ class WorkflowNamespace(socketio.AsyncNamespace):
 
     # ==================== Connection Lifecycle ====================
 
+    async def trigger_event(self, event, *args):
+        if event not in {'connect', 'disconnect'} and args:
+            session = self.sessions.get(args[0])
+            if session and session.get('user'):
+                user = await WorkflowRunRepository.get_user(session['user'].pk)
+                if not user or not user.is_active or user.is_deleted:
+                    await sio.disconnect(args[0], namespace=self.namespace)
+                    return {'error': 'Account inactive or unavailable'}
+        return await super().trigger_event(event, *args)
+
     async def on_connect(self, sid: str, environ: dict, auth: Optional[dict] = None):
         """
         Handle new connection with JWT authentication.
@@ -96,8 +106,8 @@ class WorkflowNamespace(socketio.AsyncNamespace):
 
             # Fetch user from database
             user = await WorkflowRunRepository.get_user(user_id)
-            if not user:
-                raise socketio.exceptions.ConnectionRefusedError('User not found')
+            if not user or not user.is_active or user.is_deleted:
+                raise socketio.exceptions.ConnectionRefusedError('Account inactive or unavailable')
 
             # Detect platform from Origin/Referer headers
             platform = detect_platform_from_socketio_environ(environ)

@@ -2,6 +2,7 @@
 
 from email.utils import parseaddr
 from smtplib import SMTPException
+from urllib.parse import urlsplit
 
 from django.conf import settings
 from django.contrib.sites.models import Site
@@ -27,6 +28,7 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         errors = []
+        http_admin = False
         backend = settings.EMAIL_BACKEND
         smtp = backend in {
             "email_logs.backends.LoggingSMTPEmailBackend",
@@ -63,7 +65,7 @@ class Command(BaseCommand):
                 validate_public_url(getattr(env, setting) or "")
             except ValidationError:
                 errors.append(
-                    f"Configure a valid public {setting} URL (HTTPS outside local development)."
+                    f"Configure a valid public {setting} URL (HTTPS or an explicitly allowlisted HTTP origin)."
                 )
         policy = AccessRequestPolicy.objects.filter(pk=1).first()
         if not policy:
@@ -76,6 +78,8 @@ class Command(BaseCommand):
                     validate_public_url(
                         getattr(policy, field), origin_only=field == "admin_base_url"
                     )
+                    if field == "admin_base_url":
+                        http_admin = urlsplit(policy.admin_base_url).scheme == "http"
                 except ValidationError:
                     errors.append(
                         f"Configure a valid {field} in Access request settings."
@@ -95,12 +99,21 @@ class Command(BaseCommand):
                 self.stdout.write(
                     "Email approvals are disabled; administrators must use the admin request list."
                 )
-        if not settings.DEBUG and not (
-            settings.SESSION_COOKIE_SECURE and settings.CSRF_COOKIE_SECURE
-        ):
-            errors.append(
-                "Enable secure session/CSRF cookies for the production HTTPS deployment."
-            )
+        if not settings.DEBUG:
+            if http_admin:
+                if settings.SESSION_COOKIE_SECURE or settings.CSRF_COOKIE_SECURE:
+                    errors.append(
+                        "Secure session/CSRF cookies cannot be used with the allowlisted HTTP admin origin."
+                    )
+                self.stdout.write(
+                    "HTTP admin origin explicitly allowlisted. Retain the required VPN/firewall restrictions; this mode does not add TLS."
+                )
+            elif not (
+                settings.SESSION_COOKIE_SECURE and settings.CSRF_COOKIE_SECURE
+            ):
+                errors.append(
+                    "Enable secure session/CSRF cookies for the production HTTPS deployment."
+                )
         site = Site.objects.get_current()
         if site.domain in {"example.com", "localhost"} and not settings.DEBUG:
             errors.append(
