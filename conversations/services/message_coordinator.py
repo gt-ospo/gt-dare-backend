@@ -21,6 +21,7 @@ from channels.db import database_sync_to_async
 from django.utils import timezone
 from djangorestframework_camel_case.util import camelize
 
+from billing.constants import UserWalletPreferenceTypeChoice
 from conversations.api.serializers import ArtifactListSerializer
 from conversations.constants import (
     DEFAULT_AI_SENDER_NAME,
@@ -64,16 +65,18 @@ from conversations.services.tool_loop_binding import ChatToolLoopBinding
 from conversations.services.tool_loop_service import ToolLoopResult, ToolLoopService
 from conversations.services.web_search_source_service import WebSearchSourceService
 from conversations.services.websocket_response_service import WebSocketResponseService
-from core.services.billing_service import BillingService
+from core.services.billing_service import BillingService, tracks_free_dare_wallet_usage
 from core.services.conversation_service import ConversationService
 from core.services.dtos import LLMDescriptor, LLMQueryRequestBuilder
 from core.services.file_upload_service import FileUploadService
 from core.services.learning_progress_service import LearningProgressService
 from core.services.llm_service import LLMService
 from core.services.sb_client import SocraticBooksClient
+from core.services.turn_dispatch_snapshot import capture_turn_dispatch
 from dare_tools.services.retrieval_tool_executor import RetrievalScope
 from memory.tasks import run_memory_writer
 from users.utils import should_run_learning_progress
+from users.constants import AuthSourceChoice
 
 logger = logging.getLogger(__name__)
 
@@ -338,15 +341,27 @@ class MessageCoordinator:
                 )
                 return None
             dispatch_handle = descriptor.to_dispatch_handle()
+            snapshot = None
+            if self.user and self.conversation.source == AuthSourceChoice.DARE and not self.conversation.bot_id and not descriptor.is_audio_transcriber:
+                try:
+                    snapshot = await database_sync_to_async(capture_turn_dispatch)(self.user, descriptor)
+                except ValueError as error:
+                    await self.send_error(ErrorCode.VALIDATION_ERROR, str(error))
+                    return None
 
             # Check billing if user exists. Synthetic dispatches debit zero
             # from the DARE wallet (the stub LLM carries zero rates), so the
             # estimate is $0 and the check trivially passes — kept for
             # uniformity with real-LLM messages.
             if self.user:
-                has_credits = await self.billing_service.check_sufficient_credits(
-                    self.user, dispatch_handle
-                )
+                if snapshot is not None and snapshot.wallet_type != UserWalletPreferenceTypeChoice.DARE:
+                    has_credits = True
+                elif snapshot is not None:
+                    has_credits = await self.billing_service.check_sufficient_credits(
+                        self.user, dispatch_handle, wallet_type=snapshot.wallet_type
+                    )
+                else:
+                    has_credits = await self.billing_service.check_sufficient_credits(self.user, dispatch_handle)
                 if not has_credits:
                     await self.send_error(
                         ErrorCode.INSUFFICIENT_CREDITS,
@@ -399,6 +414,7 @@ class MessageCoordinator:
                 sender=DEFAULT_AI_SENDER_NAME,
                 descriptor=descriptor,
             )
+            ai_message._dispatch_snapshot = snapshot
 
             # Send empty AI message with streaming=True to show placeholder on frontend
             placeholder_payload = await WebSocketResponseService.format_message(
@@ -504,17 +520,47 @@ class MessageCoordinator:
             if dispatch_handle is None:
                 return None  # Error already sent
 
+            snapshot = None
+            if (
+                self.user
+                and self.conversation.source == AuthSourceChoice.DARE
+                and not self.conversation.bot_id
+                and not descriptor.is_audio_transcriber
+                and not (ai_message.llm and ai_message.llm.is_audio_transcriber)
+            ):
+                try:
+                    snapshot = await database_sync_to_async(capture_turn_dispatch)(self.user, descriptor)
+                except ValueError as error:
+                    await self.send_error(ErrorCode.VALIDATION_ERROR, str(error))
+                    return None
+
             # Check billing if user exists (synthetic descriptors estimate $0).
             if self.user:
-                has_credits = await self.billing_service.check_sufficient_credits(
-                    self.user, dispatch_handle
-                )
+                if snapshot is not None and snapshot.wallet_type != UserWalletPreferenceTypeChoice.DARE:
+                    has_credits = True
+                elif snapshot is not None:
+                    has_credits = await self.billing_service.check_sufficient_credits(
+                        self.user, dispatch_handle, wallet_type=snapshot.wallet_type
+                    )
+                else:
+                    has_credits = await self.billing_service.check_sufficient_credits(self.user, dispatch_handle)
                 if not has_credits:
                     await self.send_error(
                         ErrorCode.INSUFFICIENT_CREDITS,
                         ErrorMessage.INSUFFICIENT_CREDITS,
                     )
                     return None
+
+            # Bind this generation to its actual dispatch identity. Each
+            # regeneration fetched its own message instance, so concurrent
+            # generations retain their own billing and proxy routing fields.
+            # Save only when the generated response is finalized; validation
+            # and failed credit checks leave the previous response untouched.
+            if snapshot is not None:
+                ai_message.llm = descriptor.llm
+                ai_message.litellm_key = descriptor.litellm_key
+                ai_message.litellm_model_name = descriptor.litellm_model_name
+                ai_message._dispatch_snapshot = snapshot
 
             await self._clear_regeneration_run_state(ai_message)
 
@@ -668,6 +714,13 @@ class MessageCoordinator:
             regenerate: Whether this is a regeneration request
         """
         try:
+            if tracks_free_dare_wallet_usage(self.conversation, self.user, message_obj, llm):
+                from billing.models import MessageUsageAttempt
+
+                attempt = await database_sync_to_async(MessageUsageAttempt.objects.create)(
+                    message_id=message_obj.pk
+                )
+                message_obj._usage_attempt_id = attempt.pk
             logger.info(
                 "[journey] mid=%s turn start: conv=%s regenerate=%s rag=%s "
                 "dare_tools=%s mcp_servers=%s artifacts=%s web_search=%s",
@@ -900,10 +953,15 @@ class MessageCoordinator:
                         generated_transcription_data = build_transcription_data(usage)
 
                     # Check billing during streaming (only for authenticated users)
-                    if self.user:
+                    snapshot = getattr(message_obj, "_dispatch_snapshot", None)
+                    if self.user and (snapshot is None or snapshot.wallet_type == UserWalletPreferenceTypeChoice.DARE):
                         can_continue, error_response = (
                             await self.billing_service.check_streaming_credit_usage(
-                                self.user, llm, token_usage
+                                self.user, llm, token_usage,
+                                **(
+                                    {"wallet_type": snapshot.wallet_type, "platform": self.conversation.source}
+                                    if snapshot is not None else {}
+                                ),
                             )
                         )
                         if not can_continue:

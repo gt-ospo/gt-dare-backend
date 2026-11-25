@@ -17,7 +17,8 @@ from typing import List, Optional
 
 from django.utils import timezone
 
-from core.services.vector_service import get_vector_service
+from core.services.document_embedding_profiles import GRANITE
+from core.services.vector_service import get_document_vector_service, get_vector_service
 from files.constants import FileStatus
 from files.models import DocumentChunk, File, VectorIndexAttempt
 from users.constants import VectorDBChoice
@@ -83,7 +84,7 @@ def expected_chunk_indexes(file: File) -> List[int]:
     )
 
 
-def check_index_health(file: File) -> IndexHealth:
+def check_index_health(file: File, *, allow_active_while_processing=False) -> IndexHealth:
     checked_at = timezone.now()
     expected = expected_chunk_indexes(file)
     backend = (
@@ -98,8 +99,19 @@ def check_index_health(file: File) -> IndexHealth:
         "expected": len(expected) if expected else None,
     }
 
-    if file.status == FileStatus.PROCESSING:
+    if file.status == FileStatus.PROCESSING and not (
+        allow_active_while_processing
+        and file.embedding_model != GRANITE
+        and file.index_generation
+    ):
         return IndexHealth(state=STATE_PROCESSING, present=0, **base)
+    if file.embedding_model != GRANITE and file.spin_index_unavailable:
+        return IndexHealth(
+            state=STATE_INCOMPLETE,
+            present=0,
+            error="The SPIN index may be incomplete. Reprocess using Basic to restore search.",
+            **base,
+        )
     if file.vector_db_source is None or (
         not expected and file.status != FileStatus.PROCESSED
     ):
@@ -107,7 +119,11 @@ def check_index_health(file: File) -> IndexHealth:
 
     service = None
     try:
-        service = get_vector_service(file.user_id, backend=file.vector_db_source)
+        service = (
+            get_vector_service(file.user_id, backend=file.vector_db_source)
+            if file.embedding_model == GRANITE
+            else get_document_vector_service(file.user_id, file.embedding_model, backend=file.vector_db_source)
+        )
         stored = service.list_generation_chunk_indexes(
             file.vector_index_key, file.user_id, file.pk
         )

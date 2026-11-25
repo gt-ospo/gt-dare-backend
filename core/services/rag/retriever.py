@@ -4,6 +4,7 @@ import logging
 from abc import ABC, abstractmethod
 from dataclasses import replace
 from typing import List, Optional, Tuple
+from django.conf import settings
 
 from core.helpers.openai import OpenAIWrapper
 from core.services.rag.dtos import RetrievalRequest, RetrievedChunk
@@ -111,18 +112,51 @@ class DocumentRetriever(BaseRetriever):
         # Local import: vector_service pulls in Django models at import time.
         from core.services.vector_service import get_vector_service
 
-        service = get_vector_service(request.user_id)
-        try:
-            matches = service.search_documents(
-                vector=query_vector,
-                user_id=request.user_id,
-                file_ids=list(request.file_ids),
-                top_k=request.top_k,
+        from core.services.document_embedding_profiles import GRANITE
+        from files.models import File
+        from files.services.document_embedding_search import (
+            interleave_space_rankings,
+            search_document_spaces,
+        )
+
+        self.has_spin_spaces = (
+            getattr(settings, "SPIN_DOCUMENT_EMBEDDINGS_ENABLED", False)
+            and File.active_objects.filter(
+                user_id=request.user_id, pk__in=request.file_ids
+            )
+            .exclude(embedding_model=GRANITE)
+            .exists()
+        )
+        if self.has_spin_spaces:
+            groups = search_document_spaces(
+                owner_id=request.user_id,
+                actor_id=request.payer_user_id,
+                file_ids=request.file_ids,
+                query=request.dense_query or request.query,
                 query_text=query_text,
+                granite_vector=query_vector,
+                top_k=request.top_k,
+                operation_id=request.embedding_operation_id,
                 include_vector=want_vectors,
             )
-        finally:
-            service.close()
+            matches = []
+            for number, group in enumerate(groups):
+                for match in group:
+                    match["embedding_space"] = str(number)
+            matches = interleave_space_rankings(groups, request.top_k)
+        else:
+            service = get_vector_service(request.user_id)
+            try:
+                matches = service.search_documents(
+                    vector=query_vector,
+                    user_id=request.user_id,
+                    file_ids=list(request.file_ids),
+                    top_k=request.top_k,
+                    query_text=query_text,
+                    include_vector=want_vectors,
+                )
+            finally:
+                service.close()
         chunks = []
         for m in matches:
             if m.get("score", 0.0) < request.similarity_threshold:
@@ -146,6 +180,7 @@ class DocumentRetriever(BaseRetriever):
                     retrieval_text=(
                         retrieval_text if retrieval_text != body_text else ""
                     ),
+                    embedding_space=m.get("embedding_space", ""),
                 )
             )
         return attach_structure(chunks, request.user_id)

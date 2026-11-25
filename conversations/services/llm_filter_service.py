@@ -187,11 +187,15 @@ def _filter_for_litellm(litellm_key) -> Tuple[List[Dict[str, Any]], WalletMeta]:
     cached = litellm_models_service.list_models(litellm_key)
     if not cached.models:
         return [], _litellm_meta(is_empty=True, empty_reason=EMPTY_PROBE_FAILED)
-    entries = [_litellm_entry(litellm_key, m) for m in cached.models]
+    entries = [
+        _litellm_entry(litellm_key, m)
+        for m in cached.models
+        if getattr(m, "supports_chat", None) is not False
+    ]
     providers = sorted({e["provider"] for e in entries})
     return entries, _litellm_meta(
         providers=providers,
-        is_empty=False,
+        is_empty=not entries,
         stale_probe=cached.is_stale,
     )
 

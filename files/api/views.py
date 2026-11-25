@@ -20,6 +20,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from common.permissions import IsOwner
+from billing.litellm_probe import probe_litellm_connection
 from conversations.models import Conversation
 from core.models import DareConfig
 from core.services.document_crop_service import (
@@ -28,9 +29,11 @@ from core.services.document_crop_service import (
     ElementNotFound,
 )
 from core.services.document_processor import DocumentProcessor
+from core.services.document_embedding_profiles import SPIN_PROFILES, is_spin_base_url
 from core.services.file_processor import FileProcessor
 from core.services.file_upload_service import FileUploadService
 from core.services.index_health import check_index_health
+from core.services.spin_lifecycle_lock import SpinLifecycleBusyError
 from core.services.vision_model_service import (
     VisionModelNotOffered,
     list_vision_models,
@@ -63,6 +66,8 @@ from ..services.document_reprocessing_service import (
     ReprocessingQueueError,
     ReprocessingUnavailable,
 )
+from ..services.spin_embedding_connections import personal_spin_connections
+from ..services.spin_index_deletion import SpinIndexDeletionError
 from .serializers import (
     DocumentOcrApprovalSerializer,
     FileProcessingJourneySerializer,
@@ -90,6 +95,35 @@ class FileViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, IsOwner]
     parser_classes = (MultiPartParser, FormParser, JSONParser)
 
+    def destroy(self, request, *args, **kwargs):
+        try:
+            return super().destroy(request, *args, **kwargs)
+        except SpinIndexDeletionError as error:
+            return Response({"detail": str(error)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+    @action(detail=False, methods=["get"], url_path="embedding-models")
+    def embedding_models(self, request):
+        if not getattr(settings, "SPIN_DOCUMENT_EMBEDDINGS_ENABLED", False):
+            return Response({"connections": []})
+        connections = []
+        for connection in personal_spin_connections(request.user):
+            if not is_spin_base_url(connection.base_url):
+                continue
+            result = probe_litellm_connection(connection.base_url, connection.api_key)
+            available = set(result.model_names) if result.ok else set()
+            connections.append(
+                {
+                    "id": str(connection.pk),
+                    "label": connection.label,
+                    "models": [
+                        {"id": profile.identifier, "name": profile.label}
+                        for profile in SPIN_PROFILES.values()
+                        if profile.identifier in available
+                    ],
+                }
+            )
+        return Response({"connections": connections})
+
     def get_queryset(self):
         return (
             File.active_objects.filter(user=self.request.user)
@@ -113,7 +147,9 @@ class FileViewSet(viewsets.ModelViewSet):
                 {"error": "No files uploaded."}, status=status.HTTP_400_BAD_REQUEST
             )
 
-        options = FileUploadOptionsSerializer(data=request.data)
+        options = FileUploadOptionsSerializer(
+            data=request.data, context={"request": request}
+        )
         options.is_valid(raise_exception=True)
         tags_data = request.data.get("tags", "[]")
         tag_ids = FileUploadService.parse_tags(tags_data)
@@ -129,9 +165,15 @@ class FileViewSet(viewsets.ModelViewSet):
                 chunk_size=chunk_size,
                 overlap_size=overlap_size,
                 processing_mode=options.validated_data["processing_mode"],
+                embedding_model=options.validated_data["embedding_model"],
+                embedding_connection_id=options.validated_data.get(
+                    "embedding_connection_id"
+                ),
             )
             serializer = self.get_serializer(file_instances, many=True)
             return Response(serializer.data, status=status.HTTP_201_CREATED)
+        except SpinLifecycleBusyError as e:
+            return Response({"error": str(e)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
         except ValueError as e:
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
@@ -374,12 +416,16 @@ class FileViewSet(viewsets.ModelViewSet):
 
         deleted_files = []
         failed_files = []
+        spin_cleanup_failed = False
 
         for file in files:
             try:
                 file_data = {"id": file.id, "name": file.name}
                 self.perform_destroy(file)
                 deleted_files.append(file_data)
+            except SpinIndexDeletionError as e:
+                spin_cleanup_failed = True
+                failed_files.append({"id": file.id, "error": str(e)})
             except Exception as e:
                 logger.error(f"Error deleting file ID {file.id}: {str(e)}")
                 failed_files.append({"id": file.id, "error": str(e)})
@@ -393,8 +439,15 @@ class FileViewSet(viewsets.ModelViewSet):
 
         if failed_files:
             response_data["failed_files"] = failed_files
-
-        return Response(response_data, status=status.HTTP_200_OK)
+        if spin_cleanup_failed:
+            response_data["detail"] = (
+                "Some SPIN files could not be deleted. "
+                "Check the failed files and retry; other selected files may already be deleted."
+            )
+        return Response(
+            response_data,
+            status=(status.HTTP_503_SERVICE_UNAVAILABLE if spin_cleanup_failed else status.HTTP_200_OK),
+        )
 
     # -------------------------------------------------------------------------
     # SyftBox File Sharing Actions
@@ -658,7 +711,8 @@ class FileViewSet(viewsets.ModelViewSet):
         return Response(
             {
                 "structure": structured,
-                "map": structured or DocumentChunk.objects.filter(file=file_obj).exists(),
+                "map": structured
+                or DocumentChunk.objects.filter(file=file_obj).exists(),
             }
         )
 
@@ -671,7 +725,7 @@ class FileViewSet(viewsets.ModelViewSet):
     )
     def reprocess(self, request, pk=None):
         file = self.get_object()
-        serializer = FileReprocessingSerializer(data=request.data)
+        serializer = FileReprocessingSerializer(data=request.data, context={"request": request})
         serializer.is_valid(raise_exception=True)
         try:
             file = DocumentReprocessingService().start(

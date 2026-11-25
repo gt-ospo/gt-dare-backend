@@ -9,6 +9,7 @@ from core.config.processing import VECTOR_DIMENSION
 from core.config.vector_db import get_user_namespace
 from core.helpers.pinecone import PineconeClient
 from core.helpers.weaviate import WeaviateClient
+from core.services.document_embedding_profiles import GRANITE, SPIN_PROFILES
 from files.models import File
 from users.constants import VectorDBChoice
 
@@ -227,8 +228,14 @@ class PineconeVectorService(BaseVectorService):
 class WeaviateVectorService(BaseVectorService):
     """Weaviate implementation of the vector service."""
 
-    def __init__(self):
-        self.client = WeaviateClient()
+    def __init__(self, collection_name=None, strict_deletion=False):
+        self.client = (
+            WeaviateClient(collection_name=collection_name, strict_deletion=True)
+            if collection_name and strict_deletion
+            else WeaviateClient(collection_name=collection_name)
+            if collection_name
+            else WeaviateClient()
+        )
 
     @client_operation
     def upsert_vectors(
@@ -294,6 +301,26 @@ def get_vector_service(
         return WeaviateVectorService()
     except Exception as e:
         return WeaviateVectorService()
+
+
+def get_document_vector_service(user_id, embedding_model, *, backend=None):
+    """Return the index for this embedding space without altering legacy files."""
+    if embedding_model == GRANITE:
+        return get_vector_service(user_id, backend=backend)
+    profile = SPIN_PROFILES.get(embedding_model)
+    if profile is None:
+        raise ValueError("Unsupported document embedding model")
+    selected_backend = (
+        backend
+        if backend is not None
+        else User.objects.only("vector_db").get(pk=user_id).vector_db
+    )
+    if selected_backend != VectorDBChoice.WEAVIATE:
+        raise ValueError("SPIN document embeddings require Weaviate storage")
+    base_name = settings.WEAVIATE.get("COLLECTION_NAME", "Document")
+    return WeaviateVectorService(
+        collection_name=base_name + profile.collection_suffix, strict_deletion=True
+    )
 
 
 async def get_vector_service_async(user_id: Optional[int] = None) -> BaseVectorService:

@@ -20,6 +20,7 @@ from core.services.rag import (
 )
 from core.services.vector_service import get_vector_service_async
 from libraries.services.library_search import search_libraries
+from files.services.document_embedding_search import DocumentEmbeddingAccessError
 
 from .db_helpers import get_files_from_folders, get_files_from_tags
 from .retrieval_targets import (
@@ -181,6 +182,16 @@ async def add_semantic_context_to_messages(
                 workflow_run_step_obj=workflow_run_step_obj,
                 failures=failures,
                 citations=target.citations,
+                actor_user_id=user_id,
+                operation_id=(
+                    f"message:{message_obj.pk}"
+                    if message_obj is not None
+                    else (
+                        f"workflow-step:{workflow_run_step_obj.pk}"
+                        if workflow_run_step_obj is not None
+                        else None
+                    )
+                ),
             )
 
         if context and context.strip():
@@ -292,6 +303,15 @@ def run_document_search(
         similarity_threshold=0.0,
         trace=True,
         citations=target.citations if target is not None else None,
+        embedding_operation_id=(
+            f"message:{target.message.pk}"
+            if target is not None and hasattr(target, "message")
+            else (
+                f"workflow-step:{target.run_step.pk}"
+                if target is not None and hasattr(target, "run_step")
+                else None
+            )
+        ),
     )
     pipeline = build_pipeline("document", document_processor.openai_client)
 
@@ -337,6 +357,8 @@ async def _search_documents_for_query(
             similarity_threshold,
             target,
         )
+    except DocumentEmbeddingAccessError:
+        raise
     except Exception as exc:
         logger.warning("Document context retrieval failed: %s", exc)
         if failures is not None:

@@ -20,7 +20,7 @@ from billing.constants import (
     UserWalletPreferenceTypeChoice,
 )
 from common.models import TimeStampMixin
-from conversations.models import LLM
+from conversations.models import LLM, Message
 from core.fields import EncryptedCharField
 from users.constants import AuthSourceChoice
 from users.models import AccessCodeGroup, User
@@ -287,10 +287,25 @@ def format_usd(value):
     return f"${value.normalize()}"
 
 
+class MessageUsageAttempt(models.Model):
+    """Durable identity for one generation, including regenerations."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    message = models.ForeignKey(Message, on_delete=models.CASCADE, related_name="usage_attempts")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+
 class Transaction(TimeStampMixin):
     """
     Model for transactions in the wallet.
     """
+
+    usage_attempt_id = models.UUIDField(
+        null=True,
+        blank=True,
+        unique=True,
+        help_text=_("Generation attempt identifier for idempotent usage recording."),
+    )
 
     user = models.ForeignKey(
         User,
@@ -514,7 +529,9 @@ class Transaction(TimeStampMixin):
         )
 
         wallet_affecting = (
-            self.platform == AuthSourceChoice.DARE and not external_billing
+            self.platform == AuthSourceChoice.DARE
+            and not external_billing
+            and not (self.amount == 0 and self.usage_attempt_id is not None)
         )
 
         if not wallet_affecting:

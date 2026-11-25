@@ -11,8 +11,8 @@ class VectorIntegrityError(ValueError):
     """Safe, deterministic validation failure without provider payloads."""
 
 
-def validate_embedding(vector):
-    if not isinstance(vector, (list, tuple)) or len(vector) != VECTOR_DIMENSION:
+def validate_embedding(vector, dimension=VECTOR_DIMENSION):
+    if not isinstance(vector, (list, tuple)) or len(vector) != dimension:
         raise VectorIntegrityError("Embedding has an incorrect dimension or is empty")
     if any(
         isinstance(value, bool)
@@ -25,7 +25,7 @@ def validate_embedding(vector):
         )
 
 
-def validate_generated(vectors, chunks, file_id, user_id):
+def validate_generated(vectors, chunks, file_id, user_id, dimension=VECTOR_DIMENSION):
     if len(vectors) != len(chunks):
         raise VectorIntegrityError(
             "Embedding count does not match the expected chunk count"
@@ -47,10 +47,10 @@ def validate_generated(vectors, chunks, file_id, user_id):
             raise VectorIntegrityError(
                 "Embedding ownership or chunk metadata does not match"
             )
-        validate_embedding(embedding)
+        validate_embedding(embedding, dimension)
 
 
-def verify_stored(expected, objects):
+def verify_stored(expected, objects, dimension=VECTOR_DIMENSION):
     """Compare every returned identity and persisted metadata, including source text."""
     wanted = {metadata["chunk_index"]: metadata for _, _, metadata in expected}
     if len(objects) != len(wanted):
@@ -77,7 +77,7 @@ def verify_stored(expected, objects):
         ):
             if metadata.get(key) != wanted[index].get(key):
                 raise VectorIntegrityError(f"Stored chunk metadata mismatch: {key}")
-        validate_embedding(obj["vector"])
+        validate_embedding(obj["vector"], dimension)
     if seen != set(wanted):
         raise VectorIntegrityError(
             "Stored generation is missing expected chunk identities"

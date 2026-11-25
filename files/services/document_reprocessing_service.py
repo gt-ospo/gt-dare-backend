@@ -8,12 +8,13 @@ from django.db import transaction
 from django.utils.translation import gettext_lazy as _
 from django_rq import enqueue
 
+from core.services.document_embedding_profiles import GRANITE
 from core.services.document_parsers.constants import PARSER_DOCLING
 from core.services.vision_model_service import (
     VisionModelNotOffered,
     select_vision_model,
 )
-from files.constants import DocumentReprocessingAction, FileProcessingStage, FileStatus
+from files.constants import DocumentProcessingMode, DocumentReprocessingAction, FileProcessingStage, FileStatus
 from files.models import File
 
 
@@ -57,6 +58,16 @@ class DocumentReprocessingService:
             if file.status == FileStatus.PROCESSING or file.ingestion_token:
                 raise ReprocessingUnavailable(
                     _("This file already has processing in progress.")
+                )
+            if (
+                file.embedding_model != GRANITE
+                and action == DocumentReprocessingAction.REPARSE
+                and processing_mode == DocumentProcessingMode.ADVANCED
+            ):
+                raise ReprocessingUnavailable(
+                    _("Advanced reprocessing is not yet available for SPIN-indexed documents. "
+                      "Your existing document and search index are unchanged. "
+                      "You can reprocess it using Basic or upload a new document.")
                 )
             if (
                 action == DocumentReprocessingAction.RETRY_IMAGES

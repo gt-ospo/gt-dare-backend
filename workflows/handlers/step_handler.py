@@ -14,9 +14,12 @@ from django.utils import timezone
 from conversations.models import LLM
 from conversations.services.tool_loop_service import ToolLoopService
 from core.services.dtos import LLMQueryRequestBuilder
+from core.services.document_embedding_profiles import GRANITE
+from core.services.llm_helpers.semantic_context_helpers import collect_embedding_file_ids
 from core.services.llm_helpers.retrieval_targets import ChatRetrievalTarget
 from core.services.tool_loop.binding import ArtifactHost
 from dare_tools.services.retrieval_tool_executor import RetrievalScope
+from files.models import File
 from workflows.constants import WorkflowRunStepStatus
 from workflows.handlers.base import (ExecutionNode, NodeExecutionContext,
                                      NodeExecutionResult)
@@ -160,6 +163,8 @@ class StepNodeHandler(BaseExecutionHandler):
         llm = await self._get_llm_for_step(step_data)
         config = await self._get_step_execution_config(step_data, context)
 
+        await self._check_spin_source_access(config, context)
+
         if context.turn is not None:
             # Chat-driven: the step is a full chat agent over the person's
             # own context — history, files, memory, tools — with this node's
@@ -208,7 +213,7 @@ class StepNodeHandler(BaseExecutionHandler):
             tag_ids=tuple(request.context.tag_ids or ()),
             folder_ids=tuple(request.context.folder_ids or ()),
             library_ids=tuple(request.context.library_ids or ()),
-            user_id=config['user'].id,
+            user_id=request.user.id if request.user is not None else None,
             file_owner_id=request.context.file_owner_id,
             max_context_snippets=request.context.max_context_snippets,
             similarity_threshold=request.context.document_similarity_threshold,
@@ -355,6 +360,25 @@ class StepNodeHandler(BaseExecutionHandler):
             logger.error(f"Failed to update step {node.id} status on failure: {update_error}")
 
     # ==================== Config Helpers ====================
+
+    @staticmethod
+    async def _check_spin_source_access(config, context) -> None:
+        """Do not spend a workflow owner's personal SPIN key for another user."""
+        if context.turn is not None or context.workflow_run.user_id == config["user"].id:
+            return
+        selected_ids = await collect_embedding_file_ids(
+            config["embedding_file_ids"], config["tag_ids"], None, config["user"].id
+        )
+        has_personal_spin = await database_sync_to_async(
+            lambda: File.active_objects.filter(
+                user_id=config["user"].id, pk__in=selected_ids
+            ).exclude(embedding_model=GRANITE).exists()
+        )()
+        if has_personal_spin:
+            raise ValueError(
+                "This workflow includes SPIN-indexed documents that can only "
+                "be searched by their owner using their personal SPIN connection."
+            )
 
     async def _get_step_execution_config(
         self,

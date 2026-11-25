@@ -1,9 +1,16 @@
 from django.contrib.auth import get_user_model
+from django.conf import settings
 from rest_framework import serializers
 
 from config import env
 from core.config.document_parsing import HEADING_LABELS
+from core.services.document_embedding_profiles import GRANITE, SPIN_PROFILES
 from files.services.document_reprocessing_service import failed_image_count
+from files.services.spin_embedding_connections import (
+    SpinEmbeddingConnectionUnavailable,
+    resolve_personal_spin_connection,
+)
+from users.constants import VectorDBChoice
 
 from ..constants import DocumentProcessingMode, DocumentReprocessingAction, FileStatus
 from ..models import DocumentOcrRequest, File, FileShare, Folder, Tag
@@ -82,6 +89,10 @@ class FileReprocessingSerializer(serializers.Serializer):
     )
 
     def validate(self, attrs):
+        if {"embedding_model", "embedding_connection_id"} & self.initial_data.keys():
+            raise serializers.ValidationError(
+                {"embedding_model": "Reprocessing keeps the document's original embedding model and connection."}
+            )
         if (
             attrs["action"] == DocumentReprocessingAction.REPARSE
             and "processing_mode" not in attrs
@@ -106,6 +117,44 @@ class FileUploadOptionsSerializer(serializers.Serializer):
         choices=DocumentProcessingMode.choices,
         default=DocumentProcessingMode.ADVANCED,
     )
+    embedding_model = serializers.ChoiceField(
+        choices=[GRANITE, *SPIN_PROFILES], default=GRANITE
+    )
+    embedding_connection_id = serializers.UUIDField(required=False, allow_null=True)
+
+    def validate(self, attrs):
+        model = attrs["embedding_model"]
+        connection_id = attrs.get("embedding_connection_id")
+        if model == GRANITE:
+            if connection_id is not None:
+                raise serializers.ValidationError(
+                    {
+                        "embedding_connection_id": "Granite does not use a SPIN connection."
+                    }
+                )
+            return attrs
+        user = self.context["request"].user
+        if not getattr(settings, "SPIN_DOCUMENT_EMBEDDINGS_ENABLED", False):
+            raise serializers.ValidationError(
+                {"embedding_model": "SPIN document search is not available yet."}
+            )
+        if user.vector_db != VectorDBChoice.WEAVIATE:
+            raise serializers.ValidationError(
+                {
+                    "embedding_model": "SPIN document embeddings require Weaviate storage."
+                }
+            )
+        if connection_id is None:
+            raise serializers.ValidationError(
+                {"embedding_connection_id": "Choose your personal SPIN connection."}
+            )
+        try:
+            resolve_personal_spin_connection(user, connection_id)
+        except SpinEmbeddingConnectionUnavailable as error:
+            raise serializers.ValidationError(
+                {"embedding_connection_id": str(error)}
+            ) from error
+        return attrs
 
 
 class FileSerializer(serializers.ModelSerializer):
@@ -124,6 +173,8 @@ class FileSerializer(serializers.ModelSerializer):
     is_shared_by_me = serializers.BooleanField(read_only=True, default=False)
     is_shared_publicly = serializers.BooleanField(read_only=True, default=False)
     processing_mode = serializers.CharField(read_only=True)
+    embedding_model = serializers.CharField(read_only=True)
+    embedding_connection_id = serializers.SerializerMethodField()
     parser_name = serializers.CharField(read_only=True, allow_null=True)
     # Headline counts only. The elements themselves are large, so the full
     # document model is served by the dedicated `structure` endpoint.
@@ -160,12 +211,21 @@ class FileSerializer(serializers.ModelSerializer):
             "pages_without_text",
             "parser_name",
             "processing_mode",
+            "embedding_model",
+            "embedding_connection_id",
+            "spin_index_unavailable",
             "structure_counts",
             "failed_image_count",
             "ocr",
             "created_at",
             "updated_at",
         ]
+
+    def get_embedding_connection_id(self, obj):
+        request = self.context.get("request")
+        if not request or obj.user_id != request.user.id:
+            return None
+        return str(obj.embedding_connection_id) if obj.embedding_connection_id else None
 
     def get_failed_image_count(self, obj) -> int:
         return failed_image_count(obj)

@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 from django.test import SimpleTestCase
 from django_rq.workers import get_worker_class
+from django_rq import get_queue
 from rq import Worker
 
 from core.workers import InspectableWorker
@@ -30,6 +31,8 @@ class WorkerConnectionTests(SimpleTestCase):
             events = []
             worker = object.__new__(InspectableWorker)
             with self.subTest(error=error), patch(
+                "core.workers.InspectableWorker.queue_names", return_value=["default"]
+            ), patch(
                 "core.workers.reconcile_interrupted_ingestions",
                 return_value=SimpleNamespace(interrupted=[], retained=[]),
                 side_effect=error,
@@ -41,6 +44,45 @@ class WorkerConnectionTests(SimpleTestCase):
             ):
                 worker.work()
             self.assertEqual(events, ["close", "work"])
+
+    def test_memory_only_worker_skips_document_startup(self):
+        worker = object.__new__(InspectableWorker)
+        events = []
+        with patch.object(worker, "queue_names", return_value=["memory"]), patch(
+            "core.workers.reconcile_interrupted_ingestions"
+        ) as sweep, patch("core.workers.IngestionReconciliationScheduler") as schedule, patch(
+            "core.workers.connections.close_all", side_effect=lambda: events.append("close")
+        ), patch.object(Worker, "work", side_effect=lambda *a, **k: events.append("work") or "done") as work:
+            self.assertEqual(worker.work(burst=True), "done")
+        sweep.assert_not_called()
+        schedule.assert_not_called()
+        work.assert_called_once_with(burst=True)
+        self.assertEqual(events, ["close", "work"])
+
+    def test_non_memory_only_workers_preserve_document_startup(self):
+        for queues in ([], ["default"], ["scheduler"], ["unknown"], ["default", "memory"]):
+            worker = object.__new__(InspectableWorker)
+            with self.subTest(queues=queues), patch.object(worker, "queue_names", return_value=queues), patch(
+                "core.workers.reconcile_interrupted_ingestions",
+                return_value=SimpleNamespace(interrupted=[], retained=[]),
+            ) as sweep, patch("core.workers.IngestionReconciliationScheduler") as schedule, patch(
+                "core.workers.connections.close_all"
+            ), patch.object(Worker, "work", return_value=True):
+                self.assertTrue(worker.work())
+            sweep.assert_called_once_with()
+            schedule.return_value.start.assert_called_once_with()
+
+    def test_real_rq_queue_object_is_identified_as_memory_only(self):
+        worker = InspectableWorker([get_queue("memory")])
+        self.assertEqual(worker.queue_names(), ["memory"])
+        with patch("core.workers.reconcile_interrupted_ingestions") as sweep, patch(
+            "core.workers.IngestionReconciliationScheduler"
+        ) as schedule, patch("core.workers.connections.close_all"), patch.object(
+            Worker, "work", return_value=True
+        ):
+            self.assertTrue(worker.work(burst=True))
+        sweep.assert_not_called()
+        schedule.assert_not_called()
 
     def test_every_fork_closes_parent_connections(self):
         worker = object.__new__(InspectableWorker)

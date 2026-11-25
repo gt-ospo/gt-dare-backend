@@ -122,7 +122,10 @@ def _catalog_routes(user, wallet_type: str) -> List[VisionModelRoute]:
 
 
 def _litellm_routes(key: LiteLLMKey) -> List[VisionModelRoute]:
-    names = [model.name for model in litellm_models_service.list_models(key).models]
+    names = [
+        model.name for model in litellm_models_service.list_models(key).models
+        if getattr(model, "supports_chat", None) is not False
+    ]
     routes = []
     for name in recommend_vision_models(names):
         rates = reference_rates(name)

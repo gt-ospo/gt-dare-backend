@@ -1,13 +1,14 @@
 import logging
 
 from django.conf import settings
-from django.db import models
+from django.db import models, transaction
 from django.utils.translation import gettext_lazy as _
 
 from common.managers import ActiveObjectsManager
 from common.models import BaseModel, TimeStampMixin
 from core.storage.constants import StorageBackendChoice
 from core.storage.fields import DynamicStorageFileField
+from core.services.document_embedding_profiles import GRANITE
 from users.constants import VectorDBChoice
 
 from .constants import (
@@ -136,6 +137,22 @@ class File(BaseModel):
         blank=True,
         default="",
         help_text="Active vector generation; empty selects the legacy index.",
+    )
+    embedding_model = models.CharField(
+        max_length=255,
+        default=GRANITE,
+        db_default=GRANITE,
+        help_text="Embedding space of the active document index.",
+    )
+    embedding_connection_id = models.UUIDField(
+        null=True,
+        blank=True,
+        help_text="Personal connection used to create and search the active index.",
+    )
+    spin_index_unavailable = models.BooleanField(
+        default=False,
+        db_default=False,
+        help_text="The SPIN index may have been partially deleted and requires reprocessing.",
     )
     ingestion_token = models.UUIDField(
         null=True,
@@ -291,6 +308,36 @@ class File(BaseModel):
         ]
 
     def delete(self, *args, **kwargs):
+        if self.embedding_model != GRANITE:
+            # The pre-delete signal confirms SPIN index cleanup. Keep the
+            # original bytes if the index store is unavailable.
+            from files.services.spin_index_deletion import (
+                SpinIndexBusyError,
+                SpinIndexDeletionError,
+            )
+
+            stored_file = self.file
+            try:
+                with transaction.atomic():
+                    result = super().delete(*args, **kwargs)
+            except SpinIndexBusyError:
+                raise
+            except SpinIndexDeletionError:
+                File._base_manager.filter(pk=self.pk).update(
+                    spin_index_unavailable=True,
+                    error_message=(
+                        "Deletion could not finish. The original file was kept, "
+                        "but its search index may be unavailable. Retry deletion "
+                        "or reprocess using Basic to restore search."
+                    ),
+                )
+                raise
+            if stored_file:
+                try:
+                    stored_file.delete(save=False)
+                except Exception as e:
+                    logger.warning(f"Failed to delete file from storage: {e}")
+            return result
         # Delete the actual file from storage (local or SyftBox)
         if self.file:
             try:
@@ -606,6 +653,17 @@ class VectorIndexAttempt(TimeStampMixin):
         help_text="Owner at the time of ingestion."
     )
     backend = models.IntegerField(help_text="Vector backend used for this attempt.")
+    embedding_model = models.CharField(
+        max_length=255,
+        default=GRANITE,
+        db_default=GRANITE,
+        help_text="Embedding space used by this generation.",
+    )
+    embedding_connection_id = models.UUIDField(
+        null=True,
+        blank=True,
+        help_text="Personal connection used by this generation.",
+    )
     status = models.CharField(
         max_length=16,
         default="running",
@@ -652,3 +710,27 @@ class VectorIndexAttempt(TimeStampMixin):
 
     def __str__(self):
         return f"File {self.file_id}: {self.generation} ({self.status})"
+
+
+class SpinEmbeddingCall(TimeStampMixin):
+    """Durable evidence for one SPIN embedding request, including ambiguity."""
+
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    file = models.ForeignKey(File, null=True, blank=True, on_delete=models.SET_NULL)
+    operation_id = models.CharField(max_length=255)
+    batch_number = models.PositiveIntegerField()
+    model = models.CharField(max_length=255)
+    connection_id = models.UUIDField()
+    state = models.CharField(max_length=16, default="started")
+    total_tokens = models.PositiveIntegerField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "operation_id", "batch_number"],
+                name="unique_spin_embedding_operation_batch",
+            )
+        ]
+
+    def __str__(self):
+        return f"SPIN embedding call {self.pk} ({self.state})"

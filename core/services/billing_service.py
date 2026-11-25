@@ -8,7 +8,7 @@ from django.db import transaction as db_transaction
 from django.db.models import F
 
 from api_keys.constants import BillingModeChoice
-from billing.constants import TransactionSourceChoice, TransactionTypeChoice
+from billing.constants import TransactionSourceChoice, TransactionTypeChoice, UserWalletPreferenceTypeChoice
 from billing.exceptions import PaymentRequiredError
 from billing.models import LiteLLMSpend, Transaction, Wallet
 from billing.wallet_router import (
@@ -33,6 +33,29 @@ def cached_prompt_tokens(message_obj: Message) -> int:
     return sum(
         round_usage.get("cached_input_tokens") or 0
         for round_usage in message_obj.usage_details or []
+    )
+
+
+def tracks_free_dare_wallet_usage(conversation, user, message_obj, llm) -> bool:
+    """Restrict the new attempt flow to ordinary zero-rate DARE wallet calls."""
+    if user is None:
+        return False
+    snapshot = getattr(message_obj, "_dispatch_snapshot", None)
+    is_dare_wallet = (
+        snapshot.wallet_type == UserWalletPreferenceTypeChoice.DARE
+        if snapshot is not None
+        else user is not None and user.billing_mode == BillingModeChoice.WALLET
+    )
+    return bool(
+        conversation.source == AuthSourceChoice.DARE
+        and conversation.bot_id is None
+        and user is not None
+        and is_dare_wallet
+        and message_obj.litellm_key_id is None
+        and llm is not None
+        and llm.input_token_rate_per_million == 0
+        and llm.output_token_rate_per_million == 0
+        and (llm.cached_input_token_rate_per_million is None or llm.cached_input_token_rate_per_million == 0)
     )
 
 
@@ -76,6 +99,7 @@ class BillingService:
         llm: LLM,
         estimated_input_tokens: int = 500,
         estimated_output_tokens: int = 1000,
+        wallet_type=None,
     ) -> bool:
         """
         Check if user has sufficient credits for estimated usage.
@@ -85,7 +109,7 @@ class BillingService:
         """
         try:
             billing_mode = await database_sync_to_async(lambda: user.billing_mode)()
-            if billing_mode == BillingModeChoice.OWN_API:
+            if wallet_type is None and billing_mode == BillingModeChoice.OWN_API:
                 logger.info(
                     f"User {user.id} in OWN_API mode - skipping wallet balance check"
                 )
@@ -136,7 +160,8 @@ class BillingService:
             return False
 
     async def check_streaming_credit_usage(
-        self, user: "User", llm: LLM, token_usage: Dict, platform: str = None
+        self, user: "User", llm: LLM, token_usage: Dict, platform: str = None,
+        wallet_type=None,
     ) -> tuple:
         """
         Check if user has sufficient credits during streaming.
@@ -192,7 +217,11 @@ class BillingService:
                             source=TransactionSourceChoice.USAGE,
                             input_tokens=input_tokens,
                             output_tokens=output_tokens,
-                            billing_mode=user.billing_mode,
+                            billing_mode=(
+                                BillingModeChoice.WALLET
+                                if wallet_type == UserWalletPreferenceTypeChoice.DARE
+                                else user.billing_mode
+                            ),
                             platform=platform,
                         )
                     )()
@@ -404,7 +433,7 @@ class BillingService:
         )
 
     def finalize_ai_message(
-        self, message_obj: Message, ai_response: str, token_usage: Dict
+        self, message_obj: Message, ai_response: str, token_usage: Dict, *, usage_attempt_id=None
     ) -> Message:
         """
         Finalize AI message and handle billing.
@@ -480,6 +509,57 @@ class BillingService:
                         message_obj.carbon_g = energy_data["carbon_g"]
                         message_obj.water_ml = energy_data["water_ml"]
 
+                    conversation = message_obj.conversation
+                    user = conversation.user
+                    if (
+                        cost == Decimal("0")
+                        and tracks_free_dare_wallet_usage(conversation, user, message_obj, llm)
+                        and (message_obj.input_tokens or message_obj.output_tokens)
+                    ):
+                        from billing.models import MessageUsageAttempt
+
+                        with db_transaction.atomic():
+                            # Serialize discovery for callers holding a reloaded message.
+                            Message._base_manager.select_for_update().get(pk=message_obj.pk)
+                            attempt_id = usage_attempt_id or getattr(message_obj, "_usage_attempt_id", None)
+                            attempts = MessageUsageAttempt.objects.filter(message_id=message_obj.pk)
+                            if attempt_id is not None:
+                                if not attempts.filter(pk=attempt_id).exists():
+                                    raise ValidationError("Unknown usage attempt for this message")
+                            else:
+                                ids = list(attempts.values_list("pk", flat=True)[:2])
+                                if len(ids) > 1:
+                                    raise ValidationError("Usage attempt ID is required for regenerated messages")
+                                attempt_id = ids[0] if ids else MessageUsageAttempt.objects.create(message_id=message_obj.pk).pk
+                            message_obj._usage_attempt_id = attempt_id
+                            _, created = Transaction.objects.get_or_create(
+                                usage_attempt_id=attempt_id,
+                                defaults={
+                                    "user": user,
+                                    "amount": Decimal("0.00"),
+                                    "llm": llm,
+                                    "type": TransactionTypeChoice.DEBIT,
+                                    "source": TransactionSourceChoice.USAGE,
+                                    "message": f"Message {message_obj.id}: {message_obj.message[:100]}",
+                                    "input_tokens": message_obj.input_tokens,
+                                    "output_tokens": message_obj.output_tokens,
+                                    "cached_input_tokens": cached_prompt_tokens(message_obj),
+                                    "billing_mode": (
+                                        BillingModeChoice.WALLET
+                                        if getattr(message_obj, "_dispatch_snapshot", None) is not None
+                                        else user.billing_mode
+                                    ),
+                                    "platform": conversation.source,
+                                    **energy_data,
+                                },
+                            )
+                            if created:
+                                message_obj.save()
+                            else:
+                                # A replay must not restore older response data.
+                                message_obj.refresh_from_db()
+                        return message_obj
+
                     if cost > Decimal("0.00"):
                         conversation = message_obj.conversation
 
@@ -510,10 +590,13 @@ class BillingService:
                         transaction_platform = conversation.source
 
                         # Check user's billing mode
-                        if (
-                            user is not None
-                            and user.billing_mode == BillingModeChoice.OWN_API
-                        ):
+                        snapshot = getattr(message_obj, "_dispatch_snapshot", None)
+                        uses_external_key = (
+                            snapshot.wallet_type == UserWalletPreferenceTypeChoice.BYO
+                            if snapshot is not None
+                            else user is not None and user.billing_mode == BillingModeChoice.OWN_API
+                        )
+                        if uses_external_key:
                             # User is using their own API key - create tracking transaction with $0
                             logger.info(
                                 f"User {user.id} in OWN_API mode - creating tracking transaction"

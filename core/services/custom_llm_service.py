@@ -7,6 +7,7 @@ including LiteLLM proxy servers and other OpenAI-compatible providers.
 
 import logging
 from typing import AsyncGenerator, Dict, List, Optional, Tuple, Type, TypeVar
+from urllib.parse import urlsplit
 
 import httpx
 from openai import AsyncOpenAI
@@ -81,10 +82,17 @@ class CustomLLMService:
             api_key = get_provider_api_key(llm.provider)
 
         # Initialize OpenAI client with custom base URL
+        # SPIN has a publicly trusted certificate; validate it before sending
+        # each user's personal key. Other custom endpoints retain their
+        # existing transport setting until their certificates are verified.
+        parsed_endpoint = urlsplit(endpoint)
+        verify_tls = parsed_endpoint.hostname == "spin.pace.gatech.edu"
+        if verify_tls and parsed_endpoint.scheme != "https":
+            raise ValueError("The SPIN connection must use HTTPS.")
         self.client = AsyncOpenAI(
             api_key=api_key,
             base_url=endpoint,
-            http_client=httpx.AsyncClient(verify=False),  # bypass SSL verification
+            http_client=httpx.AsyncClient(verify=verify_tls),
         )
         self.model = llm.identifier
         self.is_reasoning = llm.is_reasoning
