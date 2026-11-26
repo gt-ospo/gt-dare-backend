@@ -338,6 +338,7 @@ class LiteLLMTestResponseSerializer(serializers.Serializer):
 
     ok = serializers.BooleanField()
     models = serializers.ListField(child=serializers.CharField())
+    chat_models = serializers.ListField(child=serializers.CharField())
     recommended_models = serializers.ListField(child=serializers.CharField())
     error = serializers.CharField(allow_blank=True)
 

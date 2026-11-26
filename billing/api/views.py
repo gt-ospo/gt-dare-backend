@@ -988,7 +988,8 @@ class LiteLLMKeyViewSet(
             {
                 "ok": result.ok,
                 "models": result.model_names,
-                "recommended_models": recommend_background_models(result.model_names),
+                "chat_models": result.chat_model_names,
+                "recommended_models": recommend_background_models(result.chat_model_names),
                 "error": result.error,
             }
         ).data

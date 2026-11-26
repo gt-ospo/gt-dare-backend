@@ -28,8 +28,11 @@ FILE_TYPE_PROPERTY = Property(
 
 
 class WeaviateClient:
-    def __init__(self):
-        self.collection_name = settings.WEAVIATE.get("COLLECTION_NAME", "Document")
+    def __init__(self, collection_name=None, strict_deletion=False):
+        self.collection_name = collection_name or settings.WEAVIATE.get(
+            "COLLECTION_NAME", "Document"
+        )
+        self.strict_deletion = strict_deletion
         self.client = self._connect_to_weaviate()
         self._create_collection()
 
@@ -307,8 +310,29 @@ class WeaviateClient:
         document_filter = weaviate.classes.query.Filter.by_property("file_id").equal(
             str(file_id)
         ) & weaviate.classes.query.Filter.by_property("user_id").equal(str(user_id))
-        collection.data.delete_many(where=document_filter)
+        self._delete_matching(collection, document_filter)
         return True
+
+    def _delete_matching(self, collection, document_filter):
+        result = collection.data.delete_many(where=document_filter)
+        if not self.strict_deletion:
+            return
+        # Some Weaviate failures are returned in the result rather than
+        # raised. Do not claim that a personal index was removed unless both
+        # the acknowledgement and a direct readback confirm it.
+        if (
+            result is None
+            or not all(
+                type(getattr(result, name, None)) is int
+                for name in ("failed", "matches", "successful")
+            )
+            or result.failed != 0
+            or result.matches != result.successful
+        ):
+            raise RuntimeError("Vector deletion could not be confirmed")
+        remaining = collection.query.fetch_objects(filters=document_filter, limit=1)
+        if not isinstance(getattr(remaining, "objects", None), list) or remaining.objects:
+            raise RuntimeError("Vector deletion left matching objects")
 
     def list_generation_chunk_indexes(self, generation, user_id, logical_file_id):
         """Chunk indexes stored for one owned generation, without vectors or text.
@@ -548,7 +572,7 @@ class WeaviateClient:
             user_filter = weaviate.classes.query.Filter.by_property("user_id").equal(
                 user_id
             )
-            collection.data.delete_many(where=user_filter)
+            self._delete_matching(collection, user_filter)
             return True
         except Exception as e:
             raise Exception(f"Error deleting namespace from Weaviate: {str(e)}")

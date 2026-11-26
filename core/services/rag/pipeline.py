@@ -83,7 +83,7 @@ class RetrievalPipeline:
         rerank_on = True
         multiplier = 5
         pool = self.retriever.search(
-            replace(request, top_k=request.top_k * multiplier),
+            replace(request, top_k=request.top_k * multiplier, dense_query=dense_text),
             query_vector,
             bm25_text,
             want_vectors=exploratory,  # MMR needs candidate embeddings
@@ -109,7 +109,25 @@ class RetrievalPipeline:
         reranked = candidates
         if rerank_on:
             working_k = request.top_k * 2 if exploratory else request.top_k
-            reranked = self.reranker.rerank(request.query, candidates, len(candidates))
+            if getattr(self.retriever, "has_spin_spaces", False):
+                from files.services.document_embedding_search import (
+                    interleave_space_rankings,
+                )
+
+                groups = {}
+                for chunk in candidates:
+                    groups.setdefault(chunk.embedding_space, []).append(chunk)
+                reranked = interleave_space_rankings(
+                    [
+                        self.reranker.rerank(request.query, group, len(group))
+                        for group in groups.values()
+                    ],
+                    len(candidates),
+                )
+            else:
+                reranked = self.reranker.rerank(
+                    request.query, candidates, len(candidates)
+                )
         rerank_applied = any(chunk.rerank_score is not None for chunk in reranked)
 
         # 4) Conditional MMR — diversity for exploratory queries only. Pick
@@ -122,6 +140,7 @@ class RetrievalPipeline:
         hops = [chunk for chunk in ranked_candidates if chunk.via is not None]
         mmr_applied = (
             exploratory
+            and not getattr(self.retriever, "has_spin_spaces", False)
             and bool(query_vector)
             and bool(direct)
             and all(c.vector for c in direct[:working_k])

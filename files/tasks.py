@@ -11,7 +11,8 @@ from core.services.document_ingestion_service import (
     DocumentIngestionService,
 )
 from core.services.document_processor import DocumentProcessor
-from core.services.vector_service import get_vector_service
+from core.services.document_embedding_profiles import GRANITE
+from core.services.vector_service import get_document_vector_service, get_vector_service
 from core.storage.constants import StorageBackendChoice
 from users.constants import VectorDBChoice
 
@@ -57,8 +58,16 @@ def delete_file_vectors(file_id, user_id, index_targets=None):
             )
         ]
     try:
-        for index_key, backend in index_targets:
-            service = get_vector_service(user_id, backend=backend)
+        for target in index_targets:
+            index_key, backend = target[:2]
+            embedding_model = target[2] if len(target) > 2 else GRANITE
+            service = (
+                get_vector_service(user_id, backend=backend)
+                if embedding_model == GRANITE
+                else get_document_vector_service(
+                    user_id, embedding_model, backend=backend
+                )
+            )
             try:
                 if service.delete_file_vectors(index_key, user_id) is False:
                     raise RuntimeError("Vector backend rejected file cleanup")

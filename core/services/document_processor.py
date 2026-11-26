@@ -6,6 +6,7 @@ from uuid import uuid4
 
 from channels.db import database_sync_to_async
 from django.db import DatabaseError, transaction
+from django.conf import settings
 from django.utils import timezone
 
 from conversations.models import Snippet
@@ -19,6 +20,7 @@ from core.config.processing import (
 from core.config.vector_db import get_user_namespace
 from core.helpers.openai import OpenAIWrapper
 from core.services.document_enrichment_service import DocumentEnrichmentService
+from core.services.document_embedding_profiles import GRANITE, SPIN_PROFILES
 from core.services.document_parsers.pdf_outline import extract_pdf_outline
 from core.services.document_parsing_service import DocumentParsingService
 from core.services.document_text_sanitizer import sanitize_document_text
@@ -46,13 +48,29 @@ from core.services.vector_integrity import (
     validate_generated,
     verify_stored,
 )
-from core.services.vector_service import get_vector_service
+from core.services.vector_service import get_document_vector_service, get_vector_service
 from files.constants import DocumentProcessingMode
 from files.models import File, VectorIndexAttempt
 from files.services.document_map_service import DocumentMapService
+from files.services.spin_document_embedding_client import SpinDocumentEmbeddingClient
+from files.services.document_embedding_search import (
+    DocumentEmbeddingAccessError,
+    interleave_space_rankings,
+    search_document_spaces,
+)
 from workflows.models import WorkflowStepSnippet
+from users.constants import VectorDBChoice
 
 logger = logging.getLogger(__name__)
+
+
+def document_target_backend(file):
+    """Preserve Granite preference changes; keep SPIN indexes in Weaviate."""
+    if file.embedding_model == GRANITE:
+        return file.user.vector_db
+    if file.vector_db_source not in (None, VectorDBChoice.WEAVIATE):
+        raise ValueError("SPIN document embeddings require Weaviate storage")
+    return VectorDBChoice.WEAVIATE
 
 
 @dataclass
@@ -82,6 +100,7 @@ class DocumentProcessor:
         self.embedding_service = embedding_service or EmbeddingService(
             self.openai_client
         )
+        self.embedding_dimension = None
         self.parsing_service = parsing_service or DocumentParsingService()
         self.enrichment_service = enrichment_service or DocumentEnrichmentService()
         self.file_processor = file_processor or FileProcessor(self.parsing_service)
@@ -194,6 +213,23 @@ class DocumentProcessor:
                 else:
                     stage.add_details(**details)
 
+            embedding_model = file.embedding_model
+            embedding_connection_id = file.embedding_connection_id
+            target_backend = document_target_backend(file)
+            if embedding_model != GRANITE:
+                profile = SPIN_PROFILES[embedding_model]
+                self.embedding_dimension = profile.dimensions
+                client = SpinDocumentEmbeddingClient(
+                    user=file.user,
+                    connection_id=embedding_connection_id,
+                    model=embedding_model,
+                    operation_id=file.job_id,
+                    file_id=file.id,
+                )
+                self.embedding_service = EmbeddingService(client)
+                self.embedding_service.max_tokens_per_request = int(
+                    profile.max_input_tokens * 0.75
+                )
             generation = uuid4().hex
             with locked_ingestion_file(file):
                 VectorIndexAttempt.objects.filter(file=file, status="running").update(
@@ -205,7 +241,9 @@ class DocumentProcessor:
                     file=file,
                     generation=generation,
                     owner_id=file.user_id,
-                    backend=file.user.vector_db,
+                    backend=target_backend,
+                    embedding_model=embedding_model,
+                    embedding_connection_id=embedding_connection_id,
                 )
             with journey.stage("embedding") as stage:
                 vectors, prepared_map = self._embed_with_structure(
@@ -230,14 +268,30 @@ class DocumentProcessor:
 
             with journey.stage("indexing") as stage:
                 ensure_ingestion_owner(file)
-                self.update_vector_service(
-                    file.user.id, backend=self.index_attempt.backend
-                )
+                if embedding_model == GRANITE:
+                    self.update_vector_service(
+                        file.user.id, backend=self.index_attempt.backend
+                    )
+                else:
+                    self.vector_service = get_document_vector_service(
+                        file.user.id,
+                        embedding_model,
+                        backend=self.index_attempt.backend,
+                    )
                 if vectors:
                     staging_key = generation
-                    confirmed_vectors = self._store_vectors(
-                        vectors, file.user.id, staging_key
-                    )
+                    if embedding_model == GRANITE:
+                        confirmed_vectors = self._store_vectors(
+                            vectors, file.user.id, staging_key
+                        )
+                    else:
+                        # Deletion, reconciliation, and lease replacement
+                        # acquire this same row lock before acting. Holding it
+                        # across writes prevents them from racing a live writer.
+                        with locked_ingestion_file(file):
+                            confirmed_vectors = self._store_vectors(
+                                vectors, file.user.id, staging_key
+                            )
                     stage.add_details(
                         attempted_vectors=len(vectors),
                         acknowledged_vectors=confirmed_vectors,
@@ -253,6 +307,7 @@ class DocumentProcessor:
                 with locked_ingestion_file(file) as current:
                     previous_key = current.vector_index_key
                     previous_backend = current.vector_db_source
+                    previous_model = current.embedding_model
                     if vectors:
                         DocumentMapService.replace(
                             file, prepared_map.chunks, prepared_map.references
@@ -265,8 +320,11 @@ class DocumentProcessor:
                         )
                         file.index_generation = generation
                         file.vector_db_source = self.index_attempt.backend
+                        file.embedding_model = embedding_model
+                        file.embedding_connection_id = embedding_connection_id
+                        file.spin_index_unavailable = False
                         persist_ingestion_file(
-                            file, ["index_generation", "vector_db_source"]
+                            file, ["index_generation", "vector_db_source", "embedding_model", "embedding_connection_id", "spin_index_unavailable"]
                         )
                     self.index_attempt.status = "published" if vectors else "empty"
                     self.index_attempt.save()
@@ -278,11 +336,22 @@ class DocumentProcessor:
                     vectors=len(vectors),
                 )
             if vectors:
-                transaction.on_commit(
-                    lambda: self._retire_generation(
-                        file, previous_key, file.user.id, previous_backend
+                if previous_model == GRANITE:
+                    transaction.on_commit(
+                        lambda: self._retire_generation(
+                            file, previous_key, file.user.id, previous_backend
+                        )
                     )
-                )
+                else:
+                    transaction.on_commit(
+                        lambda: self._retire_generation(
+                            file,
+                            previous_key,
+                            file.user.id,
+                            previous_backend,
+                            previous_model,
+                        )
+                    )
 
             if owns_journey:
                 journey.complete_attempt()
@@ -448,6 +517,11 @@ class DocumentProcessor:
             [chunk.searchable_text for chunk in structured],
             file.id,
             file.user.id,
+            **(
+                {"dimension": self.embedding_dimension}
+                if self.embedding_dimension
+                else {}
+            ),
         )
         if any(
             metadata.get("file_name") != (file.name or file.file.name)
@@ -636,7 +710,15 @@ class DocumentProcessor:
                         file_id, user_id, logical_id
                     )
                     try:
-                        verify_stored(vectors, objects)
+                        verify_stored(
+                            vectors,
+                            objects,
+                            **(
+                                {"dimension": self.embedding_dimension}
+                                if self.embedding_dimension
+                                else {}
+                            ),
+                        )
                         break
                     except ValueError:
                         if retry == 2:
@@ -651,18 +733,25 @@ class DocumentProcessor:
         return len(vectors)
 
     @classmethod
-    def _retire_generation(cls, file, index_key, user_id, backend):
+    def _retire_generation(
+        cls, file, index_key, user_id, backend, embedding_model=GRANITE
+    ):
         """Drop the replaced vectors and close the book on their attempt row."""
-        cls._retire_index(index_key, user_id, backend)
+        if embedding_model == GRANITE:
+            cls._retire_index(index_key, user_id, backend)
+        else:
+            cls._retire_index(index_key, user_id, backend, embedding_model)
         VectorIndexAttempt.objects.filter(
             file=file, generation=index_key, status="published"
         ).update(status="retired", finished_at=timezone.now())
 
     @staticmethod
-    def _retire_index(index_key, user_id, backend):
+    def _retire_index(index_key, user_id, backend, embedding_model=GRANITE):
         service = None
         try:
-            service = get_vector_service(user_id, backend=backend)
+            service = get_document_vector_service(
+                user_id, embedding_model, backend=backend
+            )
             service.delete_file_vectors(index_key, user_id)
         except Exception:
             # Retired generations are never searched, even when cleanup is unavailable.
@@ -742,6 +831,8 @@ class DocumentProcessor:
         workflow_run_step_obj=None,
         failures: Optional[List[str]] = None,
         citations: Optional[CitationCounter] = None,
+        actor_user_id: Optional[int] = None,
+        operation_id: Optional[str] = None,
     ) -> str:
         """Search for similar documents based on the query text.
 
@@ -763,6 +854,8 @@ class DocumentProcessor:
                 file_ids=file_ids,
                 top_k=top_k,
                 query_text=query_text,
+                actor_user_id=actor_user_id,
+                operation_id=operation_id,
             )
 
             return await self._process_search_results(
@@ -772,14 +865,35 @@ class DocumentProcessor:
                 workflow_run_step_obj,
                 citations,
             )
+        except DocumentEmbeddingAccessError:
+            raise
         except Exception as e:
             logger.warning("Document similarity search failed: %s", e)
             if failures is not None:
                 failures.append(f"documents: {e}")
             return ""
 
-    def _query_document_vectors(self, *, user_id: int, **kwargs) -> List[Dict]:
+    def _query_document_vectors(
+        self, *, user_id: int, actor_user_id=None, operation_id=None, **kwargs
+    ) -> List[Dict]:
         """Run backend selection and active-generation lookup outside the event loop."""
+        if (
+            getattr(settings, "SPIN_DOCUMENT_EMBEDDINGS_ENABLED", False)
+            and File.active_objects.filter(user_id=user_id, pk__in=kwargs["file_ids"])
+            .exclude(embedding_model=GRANITE)
+            .exists()
+        ):
+            groups = search_document_spaces(
+                owner_id=user_id,
+                actor_id=actor_user_id,
+                file_ids=kwargs["file_ids"],
+                query=kwargs["query_text"],
+                query_text=kwargs["query_text"],
+                granite_vector=kwargs["vector"],
+                top_k=kwargs["top_k"],
+                operation_id=operation_id,
+            )
+            return interleave_space_rankings(groups, kwargs["top_k"])
         self.update_vector_service(user_id)
         return self.vector_service.search_documents(user_id=user_id, **kwargs)
 

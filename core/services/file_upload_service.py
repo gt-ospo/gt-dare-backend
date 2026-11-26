@@ -11,6 +11,9 @@ from django.db import transaction
 from django_rq import enqueue
 
 from core.storage.constants import StorageBackendChoice
+from core.services.document_embedding_profiles import (
+    GRANITE, validate_new_document_embedding,
+)
 from files.constants import ALLOWED_FILES, DocumentProcessingMode, FileStatus
 from files.models import File, Folder, Tag
 from files.tasks import process_file_embeddings
@@ -170,6 +173,8 @@ class FileUploadService:
         chunk_size: int | None = None,
         overlap_size: int | None = None,
         processing_mode: str = DocumentProcessingMode.ADVANCED,
+        embedding_model: str = GRANITE,
+        embedding_connection_id=None,
     ) -> File:
         """
         Create a file instance in the database.
@@ -191,7 +196,8 @@ class FileUploadService:
         is_media, media_type = FileUploadService.detect_media_type(
             uploaded_file.content_type
         )
-
+        if not is_media:
+            validate_new_document_embedding(embedding_model, embedding_connection_id)
         # Get storage backend based on user preference
         storage_backend = getattr(user, "storage_backend", StorageBackendChoice.LOCAL)
 
@@ -209,6 +215,9 @@ class FileUploadService:
         )
 
         file_instance.processing_mode = processing_mode
+        if not is_media:
+            file_instance.embedding_model = embedding_model
+            file_instance.embedding_connection_id = embedding_connection_id
         file_instance.file.save(file_name, uploaded_file, save=False)
         file_instance.save()
 
@@ -239,9 +248,21 @@ class FileUploadService:
         overlap_size: int | None = None,
     ) -> None:
         try:
-            job = enqueue(
-                process_file_embeddings, file_instance.id, chunk_size, overlap_size
-            )
+            if file_instance.embedding_model != GRANITE:
+                # Persist the stable operation ID before a worker can start.
+                file_instance.job_id = str(uuid.uuid4())
+                file_instance.save(update_fields=["job_id"])
+                job = enqueue(
+                    process_file_embeddings,
+                    file_instance.id,
+                    chunk_size,
+                    overlap_size,
+                    job_id=file_instance.job_id,
+                )
+            else:
+                job = enqueue(
+                    process_file_embeddings, file_instance.id, chunk_size, overlap_size
+                )
         except Exception as e:
             file_instance.status = FileStatus.FAILED
             file_instance.error_message = f"Could not queue processing: {e}"
@@ -262,6 +283,8 @@ class FileUploadService:
         chunk_size: int | None = None,
         overlap_size: int | None = None,
         processing_mode: str = DocumentProcessingMode.ADVANCED,
+        embedding_model: str = GRANITE,
+        embedding_connection_id=None,
     ) -> List[File]:
         """
         Upload multiple files and create file instances.
@@ -277,6 +300,9 @@ class FileUploadService:
         """
         if len(uploaded_files) != len(file_names):
             raise ValueError("Number of files and names do not match")
+        # Check the entire batch before writing any bytes to external storage.
+        if any(not FileUploadService.detect_media_type(f.content_type)[0] for f in uploaded_files):
+            validate_new_document_embedding(embedding_model, embedding_connection_id)
 
         file_instances = []
 
@@ -292,6 +318,8 @@ class FileUploadService:
                         chunk_size=chunk_size,
                         overlap_size=overlap_size,
                         processing_mode=processing_mode,
+                        embedding_model=embedding_model,
+                        embedding_connection_id=embedding_connection_id,
                     )
                     file_instances.append(file_instance)
                 except Exception as e:

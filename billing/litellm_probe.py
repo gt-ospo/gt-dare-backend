@@ -2,14 +2,14 @@
 Connection probe for LiteLLM proxy keys.
 
 LiteLLM serves an OpenAI-compatible HTTP API at `<base>/v1/...`; the lightest
-reachability + auth check is hitting `GET /v1/models`. Only the model id is
-kept: a gateway's `litellm_provider` names the upstream vendor, which says
+reachability + auth check is hitting `GET /v1/models`. An optional same-origin
+metadata request identifies known non-chat modes. The gateway's `litellm_provider` names the upstream vendor, which says
 nothing about how DARE reaches the model, and reading it as a transport was
 a source of misrouting.
 """
 
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 import httpx
 
@@ -17,6 +17,7 @@ import httpx
 @dataclass(frozen=True)
 class ProbedModel:
     name: str
+    supports_chat: Optional[bool] = None
 
 
 @dataclass
@@ -28,6 +29,41 @@ class LiteLLMProbeResult:
     @property
     def model_names(self) -> List[str]:
         return [m.name for m in self.models]
+
+    @property
+    def chat_model_names(self) -> List[str]:
+        return [
+            model.name for model in self.models
+            if getattr(model, "supports_chat", None) is not False
+        ]
+
+
+def _chat_modes(root: str, headers: dict, timeout: float) -> dict:
+    """Read optional LiteLLM metadata. Unknown modes retain legacy behavior."""
+    try:
+        response = httpx.get(
+            root.removesuffix("/v1") + "/model/info",
+            headers=headers,
+            timeout=timeout,
+            follow_redirects=False,
+        )
+        response.raise_for_status()
+        entries = response.json().get("data", [])
+        modes = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("model_name")
+            info = entry.get("model_info")
+            if isinstance(name, str) and isinstance(info, dict):
+                modes.setdefault(name, set()).add(info.get("mode"))
+        non_chat = {
+            "embedding", "image_generation", "audio_transcription",
+            "audio_speech", "moderation", "rerank",
+        }
+        return {name: False for name, values in modes.items() if values and values <= non_chat}
+    except (httpx.HTTPError, ValueError, AttributeError, TypeError):
+        return {}
 
 
 def probe_litellm_connection(
@@ -47,8 +83,12 @@ def probe_litellm_connection(
         response.raise_for_status()
         payload = response.json()
         entries = payload.get("data", []) if isinstance(payload, dict) else []
+        chat_modes = _chat_modes(root, headers, min(timeout, 3.0))
         models = [
-            ProbedModel(name=str(entry.get("id")))
+            ProbedModel(
+                name=str(entry.get("id")),
+                supports_chat=chat_modes.get(str(entry.get("id"))),
+            )
             for entry in entries
             if isinstance(entry, dict) and entry.get("id")
         ]

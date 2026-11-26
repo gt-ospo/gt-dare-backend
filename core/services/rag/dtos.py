@@ -55,6 +55,7 @@ class RetrievedChunk:
     section: str = ""
     via: Optional[ReferenceHop] = None  # set by the expand stage
     retrieval_text: str = ""  # enriched text used for ranking, never for citation
+    embedding_space: str = ""
 
     @property
     def searchable_text(self) -> str:
@@ -83,6 +84,8 @@ class RetrievalRequest:
     similarity_threshold: float = 0.0
     trace: bool = False  # capture a per-stage RetrievalTrace for the UI
     citations: Optional[CitationCounter] = None
+    embedding_operation_id: Optional[str] = None
+    dense_query: str = ""
 
 
 @dataclass(frozen=True)

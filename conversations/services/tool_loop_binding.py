@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 from channels.db import database_sync_to_async
 from django.utils import timezone
 
+from billing.constants import UserWalletPreferenceTypeChoice
 from conversations.constants import DEFAULT_AI_SENDER_NAME, SenderType, ToolCallOrigin
 from conversations.models import MessageToolCall
 from conversations.services.websocket_response_service import WebSocketResponseService
@@ -136,18 +137,26 @@ class ChatStreamSink:
 class ChatBillingGate:
     """Chat's mid-stream credit check; public bots (no user) pass freely."""
 
-    def __init__(self, billing_service, user, llm) -> None:
+    def __init__(self, billing_service, user, llm, snapshot=None, platform=None) -> None:
         self._billing_service = billing_service
         self._user = user
         self._llm = llm
+        self._snapshot = snapshot
+        self._platform = platform
 
     async def check(
         self, usage_totals: Dict[str, Any]
     ) -> Tuple[bool, Optional[Dict[str, Any]]]:
         if not self._user:
             return True, None
+        if self._snapshot is not None and self._snapshot.wallet_type != UserWalletPreferenceTypeChoice.DARE:
+            return True, None
         return await self._billing_service.check_streaming_credit_usage(
-            self._user, self._llm, usage_totals
+            self._user, self._llm, usage_totals,
+            **(
+                {"wallet_type": self._snapshot.wallet_type, "platform": self._platform}
+                if self._snapshot is not None else {}
+            ),
         )
 
 
@@ -175,4 +184,8 @@ class ChatToolLoopBinding:
         )
         self.store = ChatToolLoopStore(message_obj)
         self.sink = ChatStreamSink(message_obj, send_callback, regenerate)
-        self.gate = ChatBillingGate(billing_service, user, llm)
+        snapshot = getattr(message_obj, "_dispatch_snapshot", None)
+        self.gate = ChatBillingGate(
+            billing_service, user, llm, snapshot,
+            platform=conversation.source if snapshot is not None else None,
+        )

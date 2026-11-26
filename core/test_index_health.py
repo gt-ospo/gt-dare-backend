@@ -128,6 +128,45 @@ class IndexHealthTests(TestCase):
         no_backend = make_file(self.user, chunks=0, vector_db_source=None)
         self.assertEqual(self.check(no_backend).state, "not_indexed")
 
+    def test_spin_search_can_verify_existing_generation_while_processing(self):
+        file = make_file(
+            self.user,
+            status=FileStatus.PROCESSING,
+            embedding_model="embeddinggemma-2",
+            verified=3,
+        )
+        service = MagicMock()
+        service.list_generation_chunk_indexes.return_value = [0, 1, 2]
+        with patch(
+            "core.services.index_health.get_document_vector_service",
+            return_value=service,
+        ):
+            self.assertEqual(check_index_health(file).state, "processing")
+            self.assertEqual(
+                check_index_health(file, allow_active_while_processing=True).state,
+                "verified",
+            )
+            service.list_generation_chunk_indexes.return_value = [0]
+            self.assertEqual(
+                check_index_health(file, allow_active_while_processing=True).state,
+                "incomplete",
+            )
+
+    def test_spin_processing_without_previous_index_is_not_searchable(self):
+        file = make_file(
+            self.user,
+            chunks=0,
+            generation="",
+            status=FileStatus.PROCESSING,
+            embedding_model="embeddinggemma-2",
+        )
+        with patch("core.services.index_health.get_document_vector_service") as factory:
+            self.assertEqual(
+                check_index_health(file, allow_active_while_processing=True).state,
+                "processing",
+            )
+        factory.assert_not_called()
+
 
 class IndexHealthApiTests(APITestCase):
     def setUp(self):

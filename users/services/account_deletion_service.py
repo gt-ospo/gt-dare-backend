@@ -16,7 +16,8 @@ transient outage of a secondary store. The database portion is atomic.
 import logging
 from dataclasses import dataclass, field
 
-from django.db import transaction
+from django.contrib.auth import get_user_model
+from django.db import DatabaseError, transaction
 from django.db.models import Q
 from django.db.models.deletion import ProtectedError
 
@@ -24,9 +25,20 @@ from agents.models import Agent, AgentNodeData, TemplateAgentNodeData
 from billing.models import LiteLLMKey
 from core.config.vector_db import get_user_namespace
 from core.services.sb_client import SocraticBooksClient
-from core.services.vector_service import get_vector_service
+from core.services.document_embedding_profiles import GRANITE, SPIN_PROFILES
+from core.services.spin_lifecycle_lock import (
+    SpinLifecycleBusyError,
+    acquire_spin_lifecycle_lock,
+)
+from core.services.vector_service import get_document_vector_service, get_vector_service
+from users.constants import VectorDBChoice
 from email_logs.models import EmailLog
-from files.models import File
+from files.models import File, SpinEmbeddingCall, VectorIndexAttempt
+from files.services.spin_index_deletion import (
+    SpinIndexBusyError,
+    assert_spin_file_quiescent,
+    spin_account_already_purged,
+)
 from users.services.avatar_service import AvatarService
 from workflows.models import WorkflowNode
 
@@ -35,6 +47,10 @@ logger = logging.getLogger(__name__)
 
 class AccountDeletionBlocked(Exception):
     """The account cannot be deleted until an administrative conflict is resolved."""
+
+class SpinAccountPurgeBlocked(AccountDeletionBlocked):
+    """The personal vector store did not confirm complete removal."""
+
 
 
 @dataclass
@@ -50,19 +66,69 @@ class AccountDeletionService:
 
     def expunge(self, user) -> AccountDeletionReport:
         user_id = user.id
-        email = user.email
         report = AccountDeletionReport(user_id=user_id)
 
         # Fail before touching any external store: keys this user administers
         # for other users are PROTECTed and would abort the DB delete midway.
         self._ensure_not_blocked(user)
 
-        self._purge_vector_namespace(user_id, report)
-        self._delete_file_blobs(user, report)
-        self._remove_avatar(user, report)
-        self._delete_socratic_account(user_id, report)
+        try:
+            with transaction.atomic():
+                # This fence blocks only SPIN uploads for this user. File
+                # locks serialize against queued/acquiring workers and live
+                # SPIN vector writes without blocking profile edits.
+                try:
+                    acquire_spin_lifecycle_lock(user_id)
+                    spin_attempt_files = (
+                        VectorIndexAttempt.objects.filter(owner_id=user_id)
+                        .exclude(embedding_model=GRANITE)
+                        .values_list("file_id", flat=True)
+                    )
+                    spin_files = list(
+                        File._base_manager.filter(user_id=user_id)
+                        .filter(
+                            ~Q(embedding_model=GRANITE) | Q(pk__in=spin_attempt_files)
+                        )
+                        .order_by("pk")
+                        .select_for_update(nowait=True)
+                    )
+                except (DatabaseError, SpinLifecycleBusyError) as exc:
+                    raise AccountDeletionBlocked(
+                        "Your account or a document is busy. Please try deleting the account again."
+                    ) from exc
+                for file in spin_files:
+                    try:
+                        assert_spin_file_quiescent(file)
+                    except SpinIndexBusyError as exc:
+                        raise AccountDeletionBlocked(str(exc)) from exc
 
-        with transaction.atomic():
+                self._purge_spin_vector_namespaces_or_block(user_id)
+                self._purge_vector_namespace(user_id, report)
+                self._delete_file_blobs(user, report)
+                self._delete_socratic_account(user_id, report)
+                # AvatarService saves the User row. Do this after slow
+                # external cleanup so concurrent profile updates are not
+                # blocked for the duration of those network calls. Reload
+                # under a lock because the avatar may have changed while the
+                # external cleanup was in progress.
+                current_user = get_user_model()._base_manager.select_for_update().get(
+                    pk=user_id
+                )
+                self._remove_avatar(current_user, report)
+
+                with spin_account_already_purged(user_id):
+                    self._delete_database_records(current_user, current_user.email)
+        except SpinAccountPurgeBlocked:
+            # This update is outside the inner transaction so it survives that
+            # rollback in ordinary requests. Search also checks vector health
+            # in case an outer transaction rolls the marker back.
+            self._mark_spin_indexes_unavailable(user_id)
+            raise
+
+        logger.info("Expunged account %s (%s): %s", user_id, current_user.email, report)
+        return report
+
+    def _delete_database_records(self, user, email) -> None:
             # PROTECT chains abort a cascade even when the protecting row is
             # itself part of it, so protected owners go first, in dependency
             # order: node data -> agents -> LiteLLM keys -> the user cascade.
@@ -79,9 +145,6 @@ class AccountDeletionService:
                     "Some records tied to this account are protected and could "
                     "not be removed. Nothing was deleted from the database."
                 ) from exc
-
-        logger.info("Expunged account %s (%s): %s", user_id, email, report)
-        return report
 
     def _ensure_not_blocked(self, user) -> None:
         administers_foreign_keys = (
@@ -104,6 +167,48 @@ class AccountDeletionService:
         except Exception as exc:
             logger.warning("Vector purge failed for user %s: %s", user_id, exc)
             report.warnings.append("Vectorized data could not be reached for deletion.")
+    def _purge_spin_vector_namespaces_or_block(self, user_id: int) -> None:
+        # The durable call record outlives an individual File (its FK is set
+        # to null), so a deleted file whose asynchronous cleanup failed still
+        # causes the account namespace to be checked.
+        has_spin_data = (
+            SpinEmbeddingCall.objects.filter(user_id=user_id).exists()
+            or File._base_manager.filter(user_id=user_id)
+            .exclude(embedding_model="granite").exists()
+            or VectorIndexAttempt.objects.filter(owner_id=user_id)
+            .exclude(embedding_model="granite").exists()
+        )
+        if not has_spin_data:
+            return
+        for model in SPIN_PROFILES:
+            service = None
+            try:
+                service = get_document_vector_service(user_id, model, backend=VectorDBChoice.WEAVIATE)
+                if service.delete_namespace(get_user_namespace(user_id)) is not True:
+                    raise RuntimeError("SPIN vector purge was not confirmed")
+            except Exception as exc:
+                logger.warning("SPIN vector purge failed for user %s", user_id)
+                raise SpinAccountPurgeBlocked(
+                    "Your SPIN document index could not be deleted. "
+                    "Your account is still available, but some document searches "
+                    "may be unavailable. Please retry deletion later."
+                ) from exc
+            finally:
+                if service is not None:
+                    service.close()
+
+    @staticmethod
+    def _mark_spin_indexes_unavailable(user_id):
+        File._base_manager.filter(user_id=user_id).exclude(
+            embedding_model=GRANITE
+        ).update(
+            spin_index_unavailable=True,
+            error_message=(
+                "Account deletion did not finish. This file was kept, "
+                "but its search index may be incomplete. Retry account "
+                "deletion or reprocess using Basic to restore search."
+            ),
+        )
 
     def _delete_file_blobs(self, user, report: AccountDeletionReport) -> None:
         """Remove stored file contents; row deletion alone leaves blobs behind."""

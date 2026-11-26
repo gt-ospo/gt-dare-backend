@@ -6,6 +6,7 @@ from django.db import transaction
 from django.utils import timezone
 from django_rq import enqueue
 
+from core.services.document_embedding_profiles import GRANITE
 from core.services.vision_model_service import (
     VisionModelNotOffered,
     select_vision_model,
@@ -69,6 +70,11 @@ class DocumentOcrApprovalService:
             if ocr_request.status not in self.ALLOWED_STATES:
                 raise DocumentOcrInvalidState(
                     "This transcription run was already started or is not resumable."
+                )
+            if file.embedding_model != GRANITE and file.index_generation:
+                raise DocumentOcrInvalidState(
+                    "Continuing transcription for a SPIN-indexed document is not yet available. "
+                    "Your existing document and search index are unchanged."
                 )
 
             remaining_pages = max(

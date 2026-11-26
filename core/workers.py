@@ -23,17 +23,20 @@ class InspectableWorker(Worker):
         # until its heartbeat expires, so the scheduler also gets a one-off
         # follow-up sweep after that window plus the recurring schedule.
         try:
-            summary = reconcile_interrupted_ingestions()
-            if summary.interrupted or summary.retained:
-                logger.warning(
-                    "Startup sweep marked interrupted ingestions: failed=%s retained=%s",
-                    summary.interrupted,
-                    summary.retained,
+            # A memory-only worker never runs document jobs. Leave document
+            # reconciliation and its schedule to the other workers.
+            if set(self.queue_names()) != {"memory"}:
+                summary = reconcile_interrupted_ingestions()
+                if summary.interrupted or summary.retained:
+                    logger.warning(
+                        "Startup sweep marked interrupted ingestions: failed=%s retained=%s",
+                        summary.interrupted,
+                        summary.retained,
+                    )
+                logger.info(
+                    "Ingestion reconciliation schedule: %s",
+                    IngestionReconciliationScheduler().start(),
                 )
-            logger.info(
-                "Ingestion reconciliation schedule: %s",
-                IngestionReconciliationScheduler().start(),
-            )
         except Exception:
             logger.exception("Startup ingestion sweep failed; worker continues")
         finally:

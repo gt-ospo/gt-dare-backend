@@ -4,6 +4,7 @@ File node handler for workflow execution.
 Retrieves file content via vector search (embeddings) or full content extraction.
 Does NOT perform LLM calls — purely retrieval-focused.
 """
+
 import logging
 from typing import List, Optional
 
@@ -54,13 +55,17 @@ class FileNodeHandler(BaseNodeHandler):
         """
         start_time = timezone.now()
         correlation_id = f"file-{node.id}"
-        emitter = EventEmitter(context.send_callback, workflow_run_id=context.workflow_run.id)
+        emitter = EventEmitter(
+            context.send_callback, workflow_run_id=context.workflow_run.id
+        )
 
         try:
             # Validate
             file_data = await database_sync_to_async(lambda: node.db_node.data_object)()
             if not file_data or not isinstance(file_data, FileNodeData):
-                return NodeExecutionResult(success=False, error="Invalid or missing file node data")
+                return NodeExecutionResult(
+                    success=False, error="Invalid or missing file node data"
+                )
 
             logger.info(f"[{correlation_id}] Starting, mode={file_data.retrieval_mode}")
 
@@ -73,7 +78,10 @@ class FileNodeHandler(BaseNodeHandler):
                 return NodeExecutionResult(
                     success=True,
                     output="No files configured for retrieval.",
-                    metadata={'file_count': 0, 'retrieval_mode': file_data.retrieval_mode},
+                    metadata={
+                        "file_count": 0,
+                        "retrieval_mode": file_data.retrieval_mode,
+                    },
                 )
 
             # Retrieve
@@ -83,14 +91,17 @@ class FileNodeHandler(BaseNodeHandler):
             logger.info(f"[{correlation_id}] Completed in {execution_time:.2f}s")
 
             metadata = {
-                'retrieval_mode': file_data.retrieval_mode,
-                'file_count': len(files),
-                'file_ids': [f.id for f in files],
+                "retrieval_mode": file_data.retrieval_mode,
+                "file_count": len(files),
+                "file_ids": [f.id for f in files],
             }
 
             # Complete — send truncated preview to FE
             await emitter.step_completed(
-                node.id, self._truncate(output), "completed", metadata=metadata,
+                node.id,
+                self._truncate(output),
+                "completed",
+                metadata=metadata,
             )
 
             return NodeExecutionResult(
@@ -103,9 +114,13 @@ class FileNodeHandler(BaseNodeHandler):
         except Exception as e:
             error_category, error_type = categorize_error(e)
             error_msg = f"{error_category}: {e}"
-            logger.error(f"[{correlation_id}] Failed ({error_type}): {e}", exc_info=True)
+            logger.error(
+                f"[{correlation_id}] Failed ({error_type}): {e}", exc_info=True
+            )
             execution_time = (timezone.now() - start_time).total_seconds()
-            return NodeExecutionResult(success=False, error=error_msg, execution_time=execution_time)
+            return NodeExecutionResult(
+                success=False, error=error_msg, execution_time=execution_time
+            )
 
     # ==================== Retrieval ====================
 
@@ -139,9 +154,12 @@ class FileNodeHandler(BaseNodeHandler):
         return output[:WS_RESPONSE_PREVIEW_LIMIT] + f"... ({len(output)} chars total)"
 
     async def _get_files(
-        self, file_data: FileNodeData, context: NodeExecutionContext,
+        self,
+        file_data: FileNodeData,
+        context: NodeExecutionContext,
     ) -> List[File]:
         """Get active, non-deleted files with ownership validation."""
+
         def _get_validated_files():
             workflow = context.workflow_run.workflow
             return list(
@@ -151,6 +169,7 @@ class FileNodeHandler(BaseNodeHandler):
                     user_id=workflow.user_id,
                 )
             )
+
         return await database_sync_to_async(_get_validated_files)()
 
     def _get_query_text(self, file_data: FileNodeData, previous_results: dict) -> str:
@@ -160,7 +179,7 @@ class FileNodeHandler(BaseNodeHandler):
 
         if previous_results:
             for node_id, result in previous_results.items():
-                output = result.get('output', '')
+                output = result.get("output", "")
                 if output:
                     return output
 
@@ -181,7 +200,9 @@ class FileNodeHandler(BaseNodeHandler):
         user = await database_sync_to_async(lambda: workflow.user)()
 
         vector_service = await get_vector_service_async(user.id)
-        document_processor = DocumentProcessor(user_id=user.id, vector_service=vector_service)
+        document_processor = DocumentProcessor(
+            user_id=user.id, vector_service=vector_service
+        )
 
         context_text = await document_processor.search_similar_documents(
             query_text=query_text,
@@ -189,6 +210,8 @@ class FileNodeHandler(BaseNodeHandler):
             user_id=user.id,
             top_k=file_data.max_results,
             similarity_threshold=file_data.similarity_threshold,
+            actor_user_id=context.workflow_run.user_id,
+            operation_id=f"workflow-run:{context.workflow_run.pk}",
         )
 
         if not context_text:

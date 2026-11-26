@@ -181,7 +181,7 @@ class LLMService:
                 )
             context_trace["totalMs"] += media_ms + tools_ms
 
-        ai_service = await self._get_ai_service(llm, request.user)
+        ai_service = await self._get_request_ai_service(llm, request)
 
         return PreparedChat(
             messages=messages,
@@ -337,7 +337,7 @@ class LLMService:
         Yields:
             Tuple of (chunk: str, usage: Dict)
         """
-        ai_service = await self._get_ai_service(llm, request.user)
+        ai_service = await self._get_request_ai_service(llm, request)
 
         # Extract DALL-E model from LLM identifier
         model = (
@@ -389,7 +389,7 @@ class LLMService:
                 all_images, messages, request.user
             )
 
-        ai_service = await self._get_ai_service(llm, request.user)
+        ai_service = await self._get_request_ai_service(llm, request)
 
         llm_tools = self._append_web_tools(request, llm, tools)
 
@@ -463,7 +463,13 @@ class LLMService:
         """Add video transcriptions to message context for LLMs."""
         return await add_video_transcriptions_to_messages(media_items, messages, user)
 
-    async def _get_ai_service(self, llm: LLM, user=None) -> AIService:
+    async def _get_request_ai_service(self, llm, request):
+        snapshot = getattr(request.message_obj, "_dispatch_snapshot", None)
+        if snapshot is None:
+            return await self._get_ai_service(llm, request.user)
+        return await self._get_ai_service(llm, request.user, snapshot)
+
+    async def _get_ai_service(self, llm: LLM, user=None, snapshot=None) -> AIService:
         """Build the AI service that will dispatch this call.
 
         Resolution path:
@@ -482,7 +488,9 @@ class LLMService:
                 materialized from a synthetic LiteLLM descriptor.
             user: Optional user instance for wallet-aware credential resolution.
         """
-        if user:
+        if snapshot is not None:
+            creds = snapshot.credentials
+        elif user:
             creds = await get_dispatch_credentials_for_user(llm.provider, user)
         else:
             creds = ResolvedDispatchCredentials(

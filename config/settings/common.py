@@ -375,6 +375,10 @@ CHANNEL_LAYERS = {
 }
 
 # Keep optional rolling summaries off the ingestion queue unless explicitly enabled.
+SPIN_DOCUMENT_EMBEDDINGS_ENABLED = env.env.bool(
+    "SPIN_DOCUMENT_EMBEDDINGS_ENABLED", default=True
+)
+
 CONVERSATION_SUMMARY_JOBS_ENABLED = env.env.bool(
     "CONVERSATION_SUMMARY_JOBS_ENABLED", default=False
 )
