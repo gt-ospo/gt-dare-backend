@@ -49,10 +49,13 @@ Three options:
 
 ### Signup and approval
 
-There are two ordinary-user signup paths. Both require email verification and an
-administrator's approval, either through an approved invitation or review of a
-code-free registration. Applicants choose their own password on `/register`;
-administrators do not create or distribute that password.
+Users can register with a valid access code or, when enabled, without a code for
+administrator review. Both paths require email verification. A code may come
+from a manually configured group or an invitation approved before registration;
+a manually configured code does not require a separate access request. A
+code-free account remains inactive until verification and approval are complete.
+Applicants choose their own password on `/register`; administrators do not
+create or distribute that password.
 
 #### Setup and approver access
 
@@ -423,9 +426,12 @@ If `SENTRY_DSN` is configured, errors and performance traces flow to your Sentry
 
 ### Backups
 
-- **Postgres:** schedule `pg_dump` via cron. Retain at least 7 days.
-- **Vector store (Weaviate):** use Weaviate's snapshot API. Pinecone is managed.
-- **Uploaded files:** snapshot the storage volume or, if using S3, enable versioning.
+Confirm the current GT-DARE backup and recovery procedures with the deployment
+administrator; do not assume a scheduled or off-host backup is active. Arrange
+consistent backups of Postgres (including any pgvector data), the configured
+external vector stores and uploaded files. Verify encrypted off-host storage,
+independent recovery-key custody, retention and an isolated restore before
+relying on a schedule. Do not enable an unverified existing backup job.
 
 ### Monitoring
 
