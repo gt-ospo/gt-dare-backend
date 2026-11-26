@@ -32,6 +32,26 @@ SPIN_PROFILES = {
 }
 
 
+class NewDocumentEmbeddingError(ValueError):
+    """An upload requested a document embedding option that is unavailable."""
+
+    def __init__(self, field: str, message: str):
+        super().__init__(message)
+        self.field = field
+
+
+def validate_new_document_embedding(model: str, connection_id) -> None:
+    """Keep new documents on Granite without changing existing indexes."""
+    if model != GRANITE:
+        raise NewDocumentEmbeddingError(
+            "embedding_model", "New documents use the default Granite embedding model."
+        )
+    if connection_id is not None:
+        raise NewDocumentEmbeddingError(
+            "embedding_connection_id", "Granite does not use a SPIN connection."
+        )
+
+
 def is_spin_base_url(url: str) -> bool:
     """Only the verified SPIN endpoint may use this personal-key integration."""
     try:

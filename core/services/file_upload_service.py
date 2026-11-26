@@ -11,8 +11,9 @@ from django.db import transaction
 from django_rq import enqueue
 
 from core.storage.constants import StorageBackendChoice
-from core.services.document_embedding_profiles import GRANITE
-from core.services.spin_lifecycle_lock import acquire_spin_lifecycle_lock
+from core.services.document_embedding_profiles import (
+    GRANITE, validate_new_document_embedding,
+)
 from files.constants import ALLOWED_FILES, DocumentProcessingMode, FileStatus
 from files.models import File, Folder, Tag
 from files.tasks import process_file_embeddings
@@ -195,11 +196,8 @@ class FileUploadService:
         is_media, media_type = FileUploadService.detect_media_type(
             uploaded_file.content_type
         )
-        if embedding_model != GRANITE and not is_media:
-            # All application SPIN uploads enter through upload_files(), which
-            # owns an atomic block and holds this fence until commit.
-            acquire_spin_lifecycle_lock(user.pk)
-
+        if not is_media:
+            validate_new_document_embedding(embedding_model, embedding_connection_id)
         # Get storage backend based on user preference
         storage_backend = getattr(user, "storage_backend", StorageBackendChoice.LOCAL)
 
@@ -302,6 +300,9 @@ class FileUploadService:
         """
         if len(uploaded_files) != len(file_names):
             raise ValueError("Number of files and names do not match")
+        # Check the entire batch before writing any bytes to external storage.
+        if any(not FileUploadService.detect_media_type(f.content_type)[0] for f in uploaded_files):
+            validate_new_document_embedding(embedding_model, embedding_connection_id)
 
         file_instances = []
 

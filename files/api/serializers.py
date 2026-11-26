@@ -4,7 +4,9 @@ from rest_framework import serializers
 
 from config import env
 from core.config.document_parsing import HEADING_LABELS
-from core.services.document_embedding_profiles import GRANITE, SPIN_PROFILES
+from core.services.document_embedding_profiles import (
+    GRANITE, SPIN_PROFILES, NewDocumentEmbeddingError, validate_new_document_embedding,
+)
 from files.services.document_reprocessing_service import failed_image_count
 from files.services.spin_embedding_connections import (
     SpinEmbeddingConnectionUnavailable,
@@ -112,49 +114,61 @@ class FileReprocessingSerializer(serializers.Serializer):
         return attrs
 
 
-class FileUploadOptionsSerializer(serializers.Serializer):
-    processing_mode = serializers.ChoiceField(
-        choices=DocumentProcessingMode.choices,
-        default=DocumentProcessingMode.ADVANCED,
-    )
+class FileUploadEmbeddingPolicySerializer(serializers.Serializer):
     embedding_model = serializers.ChoiceField(
         choices=[GRANITE, *SPIN_PROFILES], default=GRANITE
     )
     embedding_connection_id = serializers.UUIDField(required=False, allow_null=True)
 
+    def to_internal_value(self, data):
+        # Multipart parsers may leave either supported wire spelling unchanged.
+        for alias, name in (("embeddingModel", "embedding_model"),
+                            ("embeddingConnectionId", "embedding_connection_id")):
+            if alias in data:
+                if name in data and data.get(name) != data.get(alias):
+                    raise serializers.ValidationError({name: "Conflicting values were supplied."})
+                data = data.copy()
+                data[name] = data.get(alias)
+        return super().to_internal_value(data)
+
     def validate(self, attrs):
-        model = attrs["embedding_model"]
-        connection_id = attrs.get("embedding_connection_id")
-        if model == GRANITE:
-            if connection_id is not None:
-                raise serializers.ValidationError(
-                    {
-                        "embedding_connection_id": "Granite does not use a SPIN connection."
-                    }
-                )
+        if self.context.get("media_only"):
+            if not self.context.get("legacy_media_validation"):
+                return attrs
+            model = attrs["embedding_model"]
+            connection_id = attrs.get("embedding_connection_id")
+            if model == GRANITE:
+                if connection_id is not None:
+                    raise serializers.ValidationError(
+                        {"embedding_connection_id": "Granite does not use a SPIN connection."}
+                    )
+                return attrs
+            user = self.context["request"].user
+            if not getattr(settings, "SPIN_DOCUMENT_EMBEDDINGS_ENABLED", False):
+                raise serializers.ValidationError({"embedding_model": "SPIN document search is not available yet."})
+            if user.vector_db != VectorDBChoice.WEAVIATE:
+                raise serializers.ValidationError({"embedding_model": "SPIN document embeddings require Weaviate storage."})
+            if connection_id is None:
+                raise serializers.ValidationError({"embedding_connection_id": "Choose your personal SPIN connection."})
+            try:
+                resolve_personal_spin_connection(user, connection_id)
+            except SpinEmbeddingConnectionUnavailable as error:
+                raise serializers.ValidationError({"embedding_connection_id": str(error)}) from error
             return attrs
-        user = self.context["request"].user
-        if not getattr(settings, "SPIN_DOCUMENT_EMBEDDINGS_ENABLED", False):
-            raise serializers.ValidationError(
-                {"embedding_model": "SPIN document search is not available yet."}
-            )
-        if user.vector_db != VectorDBChoice.WEAVIATE:
-            raise serializers.ValidationError(
-                {
-                    "embedding_model": "SPIN document embeddings require Weaviate storage."
-                }
-            )
-        if connection_id is None:
-            raise serializers.ValidationError(
-                {"embedding_connection_id": "Choose your personal SPIN connection."}
-            )
         try:
-            resolve_personal_spin_connection(user, connection_id)
-        except SpinEmbeddingConnectionUnavailable as error:
-            raise serializers.ValidationError(
-                {"embedding_connection_id": str(error)}
-            ) from error
+            validate_new_document_embedding(
+                attrs["embedding_model"], attrs.get("embedding_connection_id")
+            )
+        except NewDocumentEmbeddingError as error:
+            raise serializers.ValidationError({error.field: str(error)}) from error
         return attrs
+
+
+class FileUploadOptionsSerializer(FileUploadEmbeddingPolicySerializer):
+    processing_mode = serializers.ChoiceField(
+        choices=DocumentProcessingMode.choices,
+        default=DocumentProcessingMode.ADVANCED,
+    )
 
 
 class FileSerializer(serializers.ModelSerializer):

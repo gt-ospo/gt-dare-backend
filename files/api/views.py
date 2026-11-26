@@ -76,6 +76,7 @@ from .serializers import (
     FileShareSerializer,
     FileStructureSerializer,
     FileUploadOptionsSerializer,
+    FileUploadEmbeddingPolicySerializer,
     FolderSerializer,
     TagSerializer,
     VisionModelCandidateSerializer,
@@ -148,7 +149,12 @@ class FileViewSet(viewsets.ModelViewSet):
             )
 
         options = FileUploadOptionsSerializer(
-            data=request.data, context={"request": request}
+            data=request.data,
+            context={
+                "request": request,
+                "media_only": all(FileUploadService.detect_media_type(f.content_type)[0] for f in uploaded_files),
+                "legacy_media_validation": True,
+            },
         )
         options.is_valid(raise_exception=True)
         tags_data = request.data.get("tags", "[]")
@@ -971,6 +977,11 @@ class FileViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
+        options = FileUploadEmbeddingPolicySerializer(
+            data=request.data, context={"media_only": original.is_media}
+        )
+        options.is_valid(raise_exception=True)
+
         try:
             if original.storage_backend == StorageBackendChoice.SYFTBOX:
                 owner_storage = SyftBoxStorage(user_email=original.user.email)
@@ -1208,6 +1219,14 @@ class FolderViewSet(viewsets.ModelViewSet):
             serializer = self.get_serializer(folder)
             return Response(serializer.data, status=status.HTTP_201_CREATED)
 
+        options = FileUploadEmbeddingPolicySerializer(
+            data=request.data,
+            context={"media_only": bool(uploaded_files) and all(
+                FileUploadService.detect_media_type(f.content_type)[0] for f in uploaded_files
+            )},
+        )
+        options.is_valid(raise_exception=True)
+
         tags_data = request.data.get("tags", "[]")
         if isinstance(tags_data, list):
             tags_data = json.dumps(tags_data)
@@ -1315,6 +1334,14 @@ class InternalFileUploadView(APIView):
             return Response(
                 {"error": "No files uploaded"}, status=status.HTTP_400_BAD_REQUEST
             )
+
+        options = FileUploadEmbeddingPolicySerializer(
+            data=request.data,
+            context={"media_only": bool(uploaded_files) and all(
+                FileUploadService.detect_media_type(f.content_type)[0] for f in uploaded_files
+            )},
+        )
+        options.is_valid(raise_exception=True)
 
         # Get optional parameters
         file_names = (
